@@ -1,4 +1,4 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import crypto from 'node:crypto';
 import type {
   BroadcastSegment,
@@ -22,13 +22,34 @@ const BLOCKED_PATTERNS: Array<{ pattern: RegExp; reason: string }> = [
   },
 ];
 
+let moderationCooldownUntilMs = 0;
+
+function isQuotaError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
+}
+
+function isFailoverError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    isQuotaError(err) ||
+    msg.includes('503') ||
+    msg.includes('UNAVAILABLE') ||
+    msg.includes('high demand')
+  );
+}
+
 function getModerationAi(): GoogleGenAI | null {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
     return null;
   }
+  if (Date.now() < moderationCooldownUntilMs) {
+    return null;
+  }
   return new GoogleGenAI({
     apiKey,
+    apiVersion: 'v1beta',
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -86,7 +107,7 @@ export async function screenViewerRequest(
 
   try {
     const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
+      model: 'gemini-3.1-flash-lite',
       contents: `You are the real-time Broadcast Standards & Moderation Officer for PleziDo TV.
 Screen this viewer-submitted topic request before it enters the live broadcast queue.
 Category: ${category}
@@ -145,7 +166,11 @@ Evaluate:
       },
     };
   } catch (err) {
-    console.warn('[PleziDo TV] Moderation fallback on viewer request:', err instanceof Error ? err.message : err);
+    if (isQuotaError(err)) {
+      moderationCooldownUntilMs = Date.now() + 90_000;
+    } else {
+      console.warn('[PleziDo TV] Moderation fallback on viewer request:', err instanceof Error ? err.message : err);
+    }
     return {
       allowed: true,
       report: {
@@ -206,9 +231,7 @@ export async function auditSegmentBeforeBroadcast(
 
   try {
     const scriptPreview = beats.map((b, i) => `[${i}] (${b.speakerId}): ${b.text}`).join('\n');
-    const response = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: `You are the Real-Time Pre-Broadcast Fact-Checking & Moderation Editor for PleziDo TV.
+    const auditPrompt = `You are the Real-Time Pre-Broadcast Fact-Checking & Moderation Editor for PleziDo TV.
 Audit this draft broadcast segment BEFORE voice synthesis and live air.
 
 Channel: ${channel}
@@ -226,37 +249,57 @@ Tasks:
 3. Set verdict to:
    - 'cleared' if accurate and clean
    - 'cleared-with-caution' if sensitive topic handled neutrally or light source context
-   - 'flagged-revised' if you corrected an inaccurate/unverified/sensitive line before broadcast.`,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
-          type: Type.OBJECT,
-          properties: {
-            verdict: { type: Type.STRING },
-            factCheckStatus: { type: Type.STRING },
-            sensitivityCheck: { type: Type.STRING },
-            flags: { type: Type.ARRAY, items: { type: Type.STRING } },
-            notes: { type: Type.STRING },
-            revisedHeadline: { type: Type.STRING },
-            revisedSubheadline: { type: Type.STRING },
-            revisedTexts: {
-              type: Type.ARRAY,
-              items: { type: Type.STRING },
-            },
-          },
-          required: [
-            'verdict',
-            'factCheckStatus',
-            'sensitivityCheck',
-            'flags',
-            'notes',
-            'revisedHeadline',
-            'revisedSubheadline',
-            'revisedTexts',
-          ],
+   - 'flagged-revised' if you corrected an inaccurate/unverified/sensitive line before broadcast.`;
+
+    const auditSchema = {
+      type: Type.OBJECT,
+      properties: {
+        verdict: { type: Type.STRING },
+        factCheckStatus: { type: Type.STRING },
+        sensitivityCheck: { type: Type.STRING },
+        flags: { type: Type.ARRAY, items: { type: Type.STRING } },
+        notes: { type: Type.STRING },
+        revisedHeadline: { type: Type.STRING },
+        revisedSubheadline: { type: Type.STRING },
+        revisedTexts: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING },
         },
       },
-    });
+      required: [
+        'verdict',
+        'factCheckStatus',
+        'sensitivityCheck',
+        'flags',
+        'notes',
+        'revisedHeadline',
+        'revisedSubheadline',
+        'revisedTexts',
+      ],
+    };
+
+    let response;
+    try {
+      response = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: auditPrompt,
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema: auditSchema,
+        },
+      });
+    } catch (primaryErr) {
+      if (!isFailoverError(primaryErr)) throw primaryErr;
+      response = await ai.models.generateContent({
+        model: 'gemini-3.1-flash-lite',
+        contents: auditPrompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: auditSchema,
+        },
+      });
+    }
 
     const parsed = JSON.parse((response.text ?? '{}').trim()) as {
       verdict?: string;
@@ -320,7 +363,11 @@ Tasks:
       },
     };
   } catch (err) {
-    console.warn('[PleziDo TV] Pre-broadcast audit fallback:', err instanceof Error ? err.message : err);
+    if (isQuotaError(err)) {
+      moderationCooldownUntilMs = Date.now() + 90_000;
+    } else {
+      console.warn('[PleziDo TV] Pre-broadcast audit fallback:', err instanceof Error ? err.message : err);
+    }
     return {
       headline,
       subheadline,

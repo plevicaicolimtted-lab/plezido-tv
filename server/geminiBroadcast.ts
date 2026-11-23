@@ -1,14 +1,17 @@
-import { GoogleGenAI, Type } from '@google/genai';
+import { GoogleGenAI, ThinkingLevel, Type } from '@google/genai';
 import crypto from 'node:crypto';
 import type {
+  BroadcastEngineState,
   BroadcastSegment,
   CameraAngle,
   ChannelCategory,
   DialogueBeat,
+  DraftBroadcastScript,
   GroundingSource,
   HostId,
   LightingMood,
   MusicScore,
+  ScriptFormat,
   SynthPreset,
 } from '../shared/broadcastTypes.js';
 import {
@@ -20,13 +23,57 @@ import { getHostById, PERMANENT_HOSTS } from './hosts.js';
 const audioCache = new Map<string, Buffer>();
 const AUDIO_CACHE_LIMIT = 40;
 
-function getAiClient(): GoogleGenAI | null {
+const groundingCache = new Map<
+  string,
+  { brief: string; sources: GroundingSource[]; expiresAtMs: number }
+>();
+const GROUNDING_CACHE_TTL_MS = 15 * 60 * 1000;
+
+let searchCooldownUntilMs = 0;
+let textCooldownUntilMs = 0;
+let ttsCooldownUntilMs = 0;
+
+function isRateLimitError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED') || msg.includes('quota');
+}
+
+function isRetryableWithLiteError(err: unknown): boolean {
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    isRateLimitError(err) ||
+    msg.includes('503') ||
+    msg.includes('UNAVAILABLE') ||
+    msg.includes('high demand') ||
+    msg.includes('overloaded')
+  );
+}
+
+function formatReadableAiError(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  try {
+    const parsed = JSON.parse(raw) as { error?: { message?: string } };
+    if (parsed?.error?.message) {
+      return parsed.error.message;
+    }
+  } catch {
+    // Raw message is already plain text
+  }
+  return raw;
+}
+
+export function isGeminiConfigured(): boolean {
   const apiKey = process.env.GEMINI_API_KEY;
-  if (!apiKey || apiKey === 'MY_GEMINI_API_KEY') {
+  return Boolean(apiKey && apiKey !== 'MY_GEMINI_API_KEY');
+}
+
+function getAiClient(): GoogleGenAI | null {
+  if (!isGeminiConfigured()) {
     return null;
   }
   return new GoogleGenAI({
-    apiKey,
+    apiKey: process.env.GEMINI_API_KEY,
+    apiVersion: 'v1beta',
     httpOptions: {
       headers: {
         'User-Agent': 'aistudio-build',
@@ -139,7 +186,11 @@ async function synthesizeSegmentAudio(
   primaryHostId: HostId,
   coHostId: HostId | undefined,
   beats: Array<{ speakerId: HostId; text: string }>
-): Promise<{ hasAudio: boolean; durationSec: number }> {
+): Promise<{ hasAudio: boolean; durationSec: number; wavBuffer?: Buffer }> {
+  if (Date.now() < ttsCooldownUntilMs) {
+    return { hasAudio: false, durationSec: 0 };
+  }
+
   try {
     const primaryHost = getHostById(primaryHostId);
     const coHost = coHostId ? getHostById(coHostId) : undefined;
@@ -187,7 +238,7 @@ async function synthesizeSegmentAudio(
       if (base64Audio) {
         const wavBuffer = Buffer.from(base64Audio, 'base64');
         storeAudioInCache(segmentId, wavBuffer);
-        return { hasAudio: true, durationSec: getWavDurationSec(wavBuffer) };
+        return { hasAudio: true, durationSec: getWavDurationSec(wavBuffer), wavBuffer };
       }
     } else {
       const combinedScript = beats.map((b) => b.text).join(' ');
@@ -221,11 +272,15 @@ async function synthesizeSegmentAudio(
       if (base64Audio) {
         const wavBuffer = Buffer.from(base64Audio, 'base64');
         storeAudioInCache(segmentId, wavBuffer);
-        return { hasAudio: true, durationSec: getWavDurationSec(wavBuffer) };
+        return { hasAudio: true, durationSec: getWavDurationSec(wavBuffer), wavBuffer };
       }
     }
   } catch (err) {
-    console.warn('[PleziDo TV] TTS generation fallback:', err instanceof Error ? err.message : err);
+    if (isRateLimitError(err)) {
+      ttsCooldownUntilMs = Date.now() + 90_000;
+    } else {
+      console.warn('[PleziDo TV] TTS generation fallback:', err instanceof Error ? err.message : err);
+    }
   }
   return { hasAudio: false, durationSec: 0 };
 }
@@ -236,7 +291,7 @@ function distributeBeatTimings(
   coHostId: HostId | undefined,
   speechDurationSec: number,
   channel: ChannelCategory
-): { beats: DialogueBeat[]; totalDurationSec: number } {
+): { beats: DialogueBeat[]; totalDurationSec: number; speechEndSec: number } {
   const safeRaw =
     rawBeats.length > 0
       ? rawBeats
@@ -292,35 +347,33 @@ function distributeBeatTimings(
   const tailSec = channel === 'music' ? 22 : 6;
   const totalDurationSec = Math.max(36, Math.ceil(cursor + tailSec));
 
-  return { beats, totalDurationSec };
+  return { beats, totalDurationSec, speechEndSec: cursor };
 }
 
-function buildFallbackSegment(options: GenerateSegmentOptions, nowMs: number): BroadcastSegment {
-  const primaryHost = getHostById(options.primaryHostId);
+function buildFallbackDraft(options: {
+  channel: ChannelCategory;
+  primaryHostId: HostId;
+  coHostId?: HostId;
+  format: ScriptFormat;
+  topic: string;
+  nowMs: number;
+}): DraftBroadcastScript {
+  const utcTime = new Date(options.nowMs).toISOString().slice(11, 16);
   const coHost = options.coHostId ? getHostById(options.coHostId) : undefined;
-  const id = `seg-${crypto.randomUUID().slice(0, 8)}`;
-  const utcTime = new Date(nowMs).toISOString().slice(11, 16);
+  const topicText = options.topic.trim();
 
-  const presetsByChannel: Record<
+  const presets: Record<
     ChannelCategory,
-    {
-      headline: string;
-      subheadline: string;
-      summary: string;
-      beats: RawAiSegmentPayload['dialogueBeats'];
-      sceneCue: BroadcastSegment['sceneCue'];
-      musicScore: MusicScore;
-      tickerItems: string[];
-    }
+    Omit<DraftBroadcastScript, 'channel' | 'primaryHostId' | 'coHostId' | 'format' | 'groundingSources' | 'groundedBrief' | 'isLiveGrounded'>
   > = {
     news: {
-      headline: options.requestedTopic
-        ? `Live Special Report: ${options.requestedTopic}`
+      headline: topicText
+        ? `Live Special Report: ${topicText}`
         : `Global Desk Hour · ${utcTime} UTC Briefing`,
       subheadline: 'Fact-checked world affairs, tech policy & science coverage on PleziDo TV',
       summary:
         'Live anchor briefing covering global infrastructure, clean energy transitions, and technology policy updates.',
-      beats: [
+      dialogueBeats: [
         {
           speakerId: 'elena',
           text: `Good day from Studio A. It is ${utcTime} UTC, and you are watching Global Desk 24 on PleziDo TV.`,
@@ -329,15 +382,17 @@ function buildFallbackSegment(options: GenerateSegmentOptions, nowMs: number): B
         },
         {
           speakerId: 'elena',
-          text: options.requestedTopic
-            ? `Turning right now to a viewer-requested briefing on ${options.requestedTopic}, looking strictly at verified reporting and technical context.`
+          text: topicText
+            ? `Turning right now to a live studio report on ${topicText}, focusing strictly on verified context and measurable developments.`
             : 'Across international bureaus this hour, clean-grid battery storage deployments and AI semiconductor supply chains lead economic policy headlines.',
           sceneAction: 'Medium close-up on Elena Vance with side briefing graphic',
           cameraAngle: 'split-graphics',
         },
         {
-          speakerId: 'elena',
-          text: 'Stay tuned to PleziDo TV—our editorial desk verifies every bulletin in real time while Frequency and Form continues in Studio B.',
+          speakerId: coHost ? coHost.id : 'elena',
+          text: coHost
+            ? `${coHost.name.split(' ')[0]}, from your perspective on ${coHost.expertise.toLowerCase()}, what stands out most here?`
+            : 'Stay tuned to PleziDo TV—our editorial desk verifies every bulletin in real time while Frequency and Form continues in Studio B.',
           sceneAction: 'Anchor closeup returning to main camera',
           cameraAngle: 'anchor-closeup',
         },
@@ -362,19 +417,19 @@ function buildFallbackSegment(options: GenerateSegmentOptions, nowMs: number): B
       },
       tickerItems: [
         `PLEZIDO NEWS · ${utcTime} UTC LIVE DESK`,
+        'GEMINI FREE-TIER SCRIPTING, VOICE & LIVE BROADCAST ENGINE ACTIVE',
+        'STUDIO B: MARCUS COLE LIVE GENERATIVE SYNTH SESSION',
         'PRE-BROADCAST FACT-CHECK GATE ACTIVE ON ALL NEWS BULLETINS',
-        'STUDIO B: MARCUS COLE LIVE GENERATIVE SYNTH SESSION AT THE HALF HOUR',
-        'SUBMIT A TOPIC REQUEST BELOW TO ENTER THE MODERATED ON-AIR QUEUE',
       ],
     },
     music: {
-      headline: options.requestedTopic
-        ? `Studio B Session: ${options.requestedTopic}`
+      headline: topicText
+        ? `Studio B Session: ${topicText}`
         : 'Frequency & Form · Late-Night Analog Synthesis',
       subheadline: 'Live generative chord studies and music trend commentary',
       summary:
         'Marcus Cole performs an original real-time harmonic study built around warm Rhodes voicings and tape-filtered pads.',
-      beats: [
+      dialogueBeats: [
         {
           speakerId: 'marcus',
           text: `Welcome back into Studio B. You are tuned to Frequency and Form with Marcus Cole at ${utcTime} UTC.`,
@@ -383,15 +438,17 @@ function buildFallbackSegment(options: GenerateSegmentOptions, nowMs: number): B
         },
         {
           speakerId: 'marcus',
-          text: options.requestedTopic
-            ? `Someone in the booth—meaning you in the queue—asked for ${options.requestedTopic}. So we are dialing up 84 beats per minute in F minor and pretending we planned it all week.`
+          text: topicText
+            ? `Tonight’s live synthesis study is shaped around ${topicText}, running at 84 beats per minute in F minor.`
             : 'For this uninterrupted set, we are blending warm electric piano voicings with slow analog filter sweeps—proof that machines sound better when they breathe.',
           sceneAction: 'Close framing on Marcus Cole at the broadcast console',
           cameraAngle: 'anchor-closeup',
         },
         {
-          speakerId: 'marcus',
-          text: 'Let the chords settle in for the next cycle while the studio meters keep time.',
+          speakerId: coHost ? coHost.id : 'marcus',
+          text: coHost
+            ? `${coHost.name.split(' ')[0]}, notice how the harmonic bed settles right underneath the broadcast tempo.`
+            : 'Let the chords settle in for the next cycle while the studio meters keep time.',
           sceneAction: 'Split studio shot with live frequency spectrum',
           cameraAngle: 'split-graphics',
         },
@@ -421,13 +478,13 @@ function buildFallbackSegment(options: GenerateSegmentOptions, nowMs: number): B
       ],
     },
     culture: {
-      headline: options.requestedTopic
-        ? `Signal & Culture: ${options.requestedTopic}`
+      headline: topicText
+        ? `Signal & Culture: ${topicText}`
         : 'Architecture, Design & Everyday Curiosity',
       subheadline: 'General knowledge, design commentary, and live studio conversation',
       summary:
         'Sora Takahashi examines how public architecture, generative acoustics, and modern media shape daily civic spaces.',
-      beats: [
+      dialogueBeats: [
         {
           speakerId: 'sora',
           text: `Hello and welcome to Studio C! I am Sora Takahashi, broadcasting live on Signal and Culture.`,
@@ -436,8 +493,8 @@ function buildFallbackSegment(options: GenerateSegmentOptions, nowMs: number): B
         },
         {
           speakerId: 'sora',
-          text: options.requestedTopic
-            ? `Today we are diving right into ${options.requestedTopic}—unpacking why it matters and the surprising ideas connecting it to everyday life.`
+          text: topicText
+            ? `Today we are diving right into ${topicText}—unpacking why it matters and the surprising ideas connecting it to everyday life.`
             : 'Have you noticed how the best modern studios feel less like laboratories and more like quiet libraries? Warm timber and soft light change how people listen.',
           sceneAction: 'Split editorial frame with topic card',
           cameraAngle: 'split-graphics',
@@ -445,7 +502,7 @@ function buildFallbackSegment(options: GenerateSegmentOptions, nowMs: number): B
         {
           speakerId: coHost ? coHost.id : 'sora',
           text: coHost
-            ? `${coHost.name.split(' ')[0]}, I love bringing Studio A and Studio C together on this—what stands out most to you about how live craft builds audience trust?`
+            ? `${coHost.name.split(' ')[0]}, I love bringing our studios together on this—what stands out most to you about how live craft builds audience trust?`
             : 'Coming up next on PleziDo TV, we hand back to Studio A for the top-of-the-hour news bulletin.',
           sceneAction: 'Close-up in Studio C lounge',
           cameraAngle: 'anchor-closeup',
@@ -472,70 +529,65 @@ function buildFallbackSegment(options: GenerateSegmentOptions, nowMs: number): B
       tickerItems: [
         'SIGNAL & CULTURE WITH SORA TAKAHASHI · STUDIO C',
         '24/7 CONTINUOUS BROADCAST SYNCHRONIZED TO REAL TIME',
-        'EXPLORE THE PROGRAM GUIDE BELOW FOR UPCOMING HOST BLOCKS',
+        'EXPLORE THE SCRIPT STUDIO TO WRITE & AIR LIVE BROADCASTS',
       ],
     },
   };
 
-  const chosen = presetsByChannel[options.channel];
-  const { beats, totalDurationSec } = distributeBeatTimings(
-    chosen.beats,
-    options.primaryHostId,
-    options.coHostId,
-    0,
-    options.channel
-  );
-
+  const chosen = presets[options.channel];
   return {
-    id,
     channel: options.channel,
-    primaryHostId: primaryHost.id,
-    coHostId: coHost?.id,
-    showTitle: primaryHost.showTitle,
-    headline: chosen.headline,
-    subheadline: chosen.subheadline,
-    summary: chosen.summary,
-    tickerItems: chosen.tickerItems,
-    sceneCue: chosen.sceneCue,
-    dialogueBeats: beats,
-    musicScore: chosen.musicScore,
+    primaryHostId: options.primaryHostId,
+    coHostId: options.coHostId,
+    format: options.format,
+    ...chosen,
     groundingSources: [],
-    moderation: buildDefaultModerationReport(id, options.channel, chosen.headline),
-    startedAtMs: nowMs,
-    durationSec: totalDurationSec,
-    endsAtMs: nowMs + totalDurationSec * 1000,
-    hasAudio: false,
-    audioUrl: null,
+    groundedBrief: '',
     isLiveGrounded: false,
-    requestedBy: options.requestedBy,
   };
 }
 
-export async function generateLiveBroadcastSegment(
-  options: GenerateSegmentOptions
-): Promise<BroadcastSegment> {
-  const nowMs = options.nowMs ?? Date.now();
+export async function draftScriptWithGemini(options: {
+  channel: ChannelCategory;
+  primaryHostId: HostId;
+  coHostId?: HostId;
+  format: ScriptFormat;
+  topic: string;
+  requestedBy?: string;
+  throwOnUpstreamError?: boolean;
+}): Promise<DraftBroadcastScript> {
+  const nowMs = Date.now();
   const ai = getAiClient();
   if (!ai) {
-    return buildFallbackSegment(options, nowMs);
+    return buildFallbackDraft({ ...options, nowMs });
+  }
+
+  if (!options.throwOnUpstreamError && nowMs < textCooldownUntilMs) {
+    return buildFallbackDraft({ ...options, nowMs });
   }
 
   const primaryHost = getHostById(options.primaryHostId);
   const coHost = options.coHostId ? getHostById(options.coHostId) : undefined;
   const isoNow = new Date(nowMs).toISOString();
-  const segmentId = `seg-${crypto.randomUUID().slice(0, 8)}`;
 
   try {
     let groundedBrief = '';
     let groundingSources: GroundingSource[] = [];
 
-    // Step 1: Live Google Search Grounding for News, Culture, or Topic Requests
-    if (options.channel === 'news' || options.channel === 'culture' || options.requestedTopic) {
-      const searchPrompt = options.requestedTopic
-        ? `Today is ${isoNow}. Research accurate, verified facts and current developments about: "${options.requestedTopic}". Provide 3 concise, factual bullet points suitable for a live television broadcast.`
+    const wantsSearch =
+      options.channel === 'news' || options.channel === 'culture' || Boolean(options.topic.trim());
+    const cacheKey = `${options.channel}:${options.topic.trim().toLowerCase() || 'headline'}`;
+    const cachedGrounding = groundingCache.get(cacheKey);
+
+    if (wantsSearch && cachedGrounding && cachedGrounding.expiresAtMs > nowMs) {
+      groundedBrief = cachedGrounding.brief;
+      groundingSources = cachedGrounding.sources;
+    } else if (wantsSearch && nowMs >= searchCooldownUntilMs) {
+      const searchPrompt = options.topic.trim()
+        ? `Today is ${isoNow}. Research accurate, verified facts and current developments about: "${options.topic.trim()}". Provide 3 concise, factual bullet points suitable for a live television broadcast.`
         : options.channel === 'news'
-          ? `Today is ${isoNow}. Summarize 3 top verified breaking global news and technology stories happening right now across world affairs, science, or global markets. Be factual and concise.`
-          : `Today is ${isoNow}. Summarize 2 timely, interesting developments in global culture, architecture, music trends, or general knowledge happening right now for a thoughtful TV feature on "${options.theme}".`;
+          ? `Today is ${isoNow}. Summarize 3 top verified breaking global news and technology stories happening right now across world affairs, science, or global markets.`
+          : `Today is ${isoNow}. Summarize 2 timely developments in global culture, architecture, music trends, or general knowledge happening right now.`;
 
       try {
         const searchResponse = await ai.models.generateContent({
@@ -547,32 +599,43 @@ export async function generateLiveBroadcastSegment(
         });
         groundedBrief = searchResponse.text?.trim() ?? '';
         groundingSources = extractGroundingSources(searchResponse);
+        if (groundedBrief || groundingSources.length > 0) {
+          groundingCache.set(cacheKey, {
+            brief: groundedBrief,
+            sources: groundingSources,
+            expiresAtMs: nowMs + GROUNDING_CACHE_TTL_MS,
+          });
+        }
       } catch (searchErr) {
-        console.warn(
-          '[PleziDo TV] Search grounding skipped:',
-          searchErr instanceof Error ? searchErr.message : searchErr
-        );
+        if (isRateLimitError(searchErr)) {
+          searchCooldownUntilMs = Date.now() + 5 * 60 * 1000;
+        } else {
+          console.warn(
+            '[PleziDo TV] Search grounding unavailable for this cycle:',
+            searchErr instanceof Error ? searchErr.message : searchErr
+          );
+        }
       }
     }
 
-    // Step 2: Structured Live Broadcast Script with Distinct Host Personalities
     const hostProfiles = PERMANENT_HOSTS.map(
       (h) =>
         `${h.id} (${h.name}): Tone="${h.personaTone}"; Expertise="${h.expertise}"; Traits=[${h.personaTraits.join(', ')}]; Interaction="${h.interactionStyle}"`
     ).join('\n');
 
     const coHostDirective = coHost
-      ? `Write a natural 2-speaker broadcast conversation alternating between ${primaryHost.id} (${primaryHost.name}) and ${coHost.id} (${coHost.name}) where their distinct personalities bounce off each other naturally (you may use occasional natural cues like |mhm| or <breath> sparingly in dialogue).`
+      ? `Write a natural 2-speaker broadcast conversation alternating between ${primaryHost.id} (${primaryHost.name}) and ${coHost.id} (${coHost.name}) where their distinct personalities bounce off each other naturally.`
       : `All dialogueBeats must be spoken by ${primaryHost.id} (${primaryHost.name}), strongly reflecting their ${primaryHost.personaTone} personality and expertise in ${primaryHost.expertise}.`;
 
-    const structuredPrompt = `You are the live television showrunner for PleziDo TV, a 24/7 real-time AI-driven network.
+    const structuredPrompt = `You are the live television scriptwriter for PleziDo TV, a 24/7 real-time AI-driven network powered by free-tier Gemini models.
 Current UTC timestamp: ${isoNow}
 Channel: ${options.channel}
+Format: ${options.format}
 Show: ${primaryHost.showTitle}
 Primary Host: ${primaryHost.id} (${primaryHost.name})
 ${coHost ? `Co-Host: ${coHost.id} (${coHost.name})` : ''}
-Segment Theme: ${options.theme}
-${options.requestedTopic ? `Viewer Live Request Topic: "${options.requestedTopic}" (Requested by ${options.requestedBy || 'a viewer'})` : ''}
+Topic / Brief: "${options.topic.trim() || primaryHost.scheduleSummary}"
+${options.requestedBy ? `Requested by: ${options.requestedBy}` : ''}
 ${groundedBrief ? `Verified Real-Time Grounded Facts:\n${groundedBrief}` : ''}
 
 Permanent Host Personas:
@@ -587,141 +650,110 @@ Rules:
 - For musicScore: compose real musical metadata (title, genre, bpm between 68 and 126, musicalKey like 'F minor' or 'D minor', chordProgression of 4 standard chord symbols, synthPreset from 'ambient-pad' | 'warm-rhodes' | 'minimal-pulse' | 'deep-dub', intensity 0.35 to 0.95).
 - Provide 4 concise tickerItems for the live bottom broadcast ticker.`;
 
-    const structuredResponse = await ai.models.generateContent({
-      model: 'gemini-4-hydrogen',
-      contents: structuredPrompt,
-      config: {
-        responseMimeType: 'application/json',
-        responseSchema: {
+    const scriptResponseSchema = {
+      type: Type.OBJECT,
+      properties: {
+        headline: { type: Type.STRING },
+        subheadline: { type: Type.STRING },
+        summary: { type: Type.STRING },
+        tickerItems: {
+          type: Type.ARRAY,
+          items: { type: Type.STRING },
+        },
+        sceneCue: {
           type: Type.OBJECT,
           properties: {
-            headline: { type: Type.STRING },
-            subheadline: { type: Type.STRING },
-            summary: { type: Type.STRING },
-            tickerItems: {
+            cameraAngle: { type: Type.STRING },
+            lightingMood: { type: Type.STRING },
+            visualCardTitle: { type: Type.STRING },
+            visualCardStat: { type: Type.STRING },
+            visualCardDetail: { type: Type.STRING },
+            locationLabel: { type: Type.STRING },
+          },
+          required: [
+            'cameraAngle',
+            'lightingMood',
+            'visualCardTitle',
+            'visualCardStat',
+            'visualCardDetail',
+            'locationLabel',
+          ],
+        },
+        dialogueBeats: {
+          type: Type.ARRAY,
+          items: {
+            type: Type.OBJECT,
+            properties: {
+              speakerId: { type: Type.STRING },
+              text: { type: Type.STRING },
+              sceneAction: { type: Type.STRING },
+              cameraAngle: { type: Type.STRING },
+            },
+            required: ['speakerId', 'text', 'sceneAction', 'cameraAngle'],
+          },
+        },
+        musicScore: {
+          type: Type.OBJECT,
+          properties: {
+            title: { type: Type.STRING },
+            genre: { type: Type.STRING },
+            bpm: { type: Type.NUMBER },
+            musicalKey: { type: Type.STRING },
+            mood: { type: Type.STRING },
+            chordProgression: {
               type: Type.ARRAY,
               items: { type: Type.STRING },
             },
-            sceneCue: {
-              type: Type.OBJECT,
-              properties: {
-                cameraAngle: { type: Type.STRING },
-                lightingMood: { type: Type.STRING },
-                visualCardTitle: { type: Type.STRING },
-                visualCardStat: { type: Type.STRING },
-                visualCardDetail: { type: Type.STRING },
-                locationLabel: { type: Type.STRING },
-              },
-              required: [
-                'cameraAngle',
-                'lightingMood',
-                'visualCardTitle',
-                'visualCardStat',
-                'visualCardDetail',
-                'locationLabel',
-              ],
-            },
-            dialogueBeats: {
-              type: Type.ARRAY,
-              items: {
-                type: Type.OBJECT,
-                properties: {
-                  speakerId: { type: Type.STRING },
-                  text: { type: Type.STRING },
-                  sceneAction: { type: Type.STRING },
-                  cameraAngle: { type: Type.STRING },
-                },
-                required: ['speakerId', 'text', 'sceneAction', 'cameraAngle'],
-              },
-            },
-            musicScore: {
-              type: Type.OBJECT,
-              properties: {
-                title: { type: Type.STRING },
-                genre: { type: Type.STRING },
-                bpm: { type: Type.NUMBER },
-                musicalKey: { type: Type.STRING },
-                mood: { type: Type.STRING },
-                chordProgression: {
-                  type: Type.ARRAY,
-                  items: { type: Type.STRING },
-                },
-                synthPreset: { type: Type.STRING },
-                intensity: { type: Type.NUMBER },
-              },
-              required: [
-                'title',
-                'genre',
-                'bpm',
-                'musicalKey',
-                'mood',
-                'chordProgression',
-                'synthPreset',
-                'intensity',
-              ],
-            },
+            synthPreset: { type: Type.STRING },
+            intensity: { type: Type.NUMBER },
           },
           required: [
-            'headline',
-            'subheadline',
-            'summary',
-            'tickerItems',
-            'sceneCue',
-            'dialogueBeats',
-            'musicScore',
+            'title',
+            'genre',
+            'bpm',
+            'musicalKey',
+            'mood',
+            'chordProgression',
+            'synthPreset',
+            'intensity',
           ],
         },
       },
-    });
+      required: [
+        'headline',
+        'subheadline',
+        'summary',
+        'tickerItems',
+        'sceneCue',
+        'dialogueBeats',
+        'musicScore',
+      ],
+    };
+
+    let structuredResponse;
+    try {
+      structuredResponse = await ai.models.generateContent({
+        model: 'gemini-4-hydrogen',
+        contents: structuredPrompt,
+        config: {
+          thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+          responseMimeType: 'application/json',
+          responseSchema: scriptResponseSchema,
+        },
+      });
+    } catch (primaryErr) {
+      if (!isRetryableWithLiteError(primaryErr)) throw primaryErr;
+      structuredResponse = await ai.models.generateContent({
+        model: 'gemini-3.1-flash-lite',
+        contents: structuredPrompt,
+        config: {
+          responseMimeType: 'application/json',
+          responseSchema: scriptResponseSchema,
+        },
+      });
+    }
 
     const parsed = JSON.parse((structuredResponse.text ?? '{}').trim()) as RawAiSegmentPayload;
-
-    // Step 3: Real-Time Pre-Broadcast Fact-Checking & Moderation Audit BEFORE TTS / Airing
-    const rawBeatList = (parsed.dialogueBeats ?? []).map((b) => ({
-      speakerId: (coHost && b.speakerId === coHost.id ? coHost.id : primaryHost.id) as HostId,
-      text: b.text,
-      sceneAction: b.sceneAction,
-      cameraAngle: b.cameraAngle,
-    }));
-
-    const audit = await auditSegmentBeforeBroadcast(
-      segmentId,
-      options.channel,
-      parsed.headline || `${primaryHost.showTitle} Live`,
-      parsed.subheadline || primaryHost.studioName,
-      rawBeatList.map((b) => ({ speakerId: b.speakerId, text: b.text })),
-      groundedBrief,
-      groundingSources.length
-    );
-
-    const auditedRawBeats: RawAiSegmentPayload['dialogueBeats'] = rawBeatList.map((b, i) => ({
-      speakerId: b.speakerId,
-      text: audit.revisedBeats[i]?.text ?? b.text,
-      sceneAction: b.sceneAction,
-      cameraAngle: b.cameraAngle,
-    }));
-
-    // Step 4: Synthesize permanent host voice WAV audio via Gemini 3.8 TTS
-    const normalizedForTts = auditedRawBeats.map((b) => ({
-      speakerId: (coHost && b.speakerId === coHost.id ? coHost.id : primaryHost.id) as HostId,
-      text: b.text,
-    }));
-
-    const { hasAudio, durationSec: speechSec } = await synthesizeSegmentAudio(
-      ai,
-      segmentId,
-      primaryHost.id,
-      coHost?.id,
-      normalizedForTts
-    );
-
-    const { beats, totalDurationSec } = distributeBeatTimings(
-      auditedRawBeats,
-      primaryHost.id,
-      coHost?.id,
-      speechSec,
-      options.channel
-    );
 
     const validLighting: LightingMood =
       parsed.sceneCue?.lightingMood === 'news-crisp' ||
@@ -745,13 +777,12 @@ Rules:
           : 'ambient-pad';
 
     return {
-      id: segmentId,
       channel: options.channel,
       primaryHostId: primaryHost.id,
       coHostId: coHost?.id,
-      showTitle: primaryHost.showTitle,
-      headline: audit.headline,
-      subheadline: audit.subheadline,
+      format: options.format,
+      headline: parsed.headline || `${primaryHost.showTitle} Live`,
+      subheadline: parsed.subheadline || primaryHost.studioName,
       summary: parsed.summary || '',
       tickerItems:
         Array.isArray(parsed.tickerItems) && parsed.tickerItems.length > 0
@@ -771,7 +802,17 @@ Rules:
         visualCardDetail: parsed.sceneCue?.visualCardDetail || primaryHost.studioName,
         locationLabel: parsed.sceneCue?.locationLabel || primaryHost.studioName,
       },
-      dialogueBeats: beats,
+      dialogueBeats: (parsed.dialogueBeats ?? []).map((b) => ({
+        speakerId: (coHost && b.speakerId === coHost.id ? coHost.id : primaryHost.id) as HostId,
+        text: b.text,
+        sceneAction: b.sceneAction || primaryHost.studioName,
+        cameraAngle:
+          b.cameraAngle === 'wide-studio' ||
+          b.cameraAngle === 'anchor-closeup' ||
+          b.cameraAngle === 'split-graphics'
+            ? b.cameraAngle
+            : 'anchor-closeup',
+      })),
       musicScore: {
         title: parsed.musicScore?.title || 'PleziDo Studio Bed',
         genre: parsed.musicScore?.genre || 'Broadcast Ambient',
@@ -787,17 +828,191 @@ Rules:
         intensity: Math.min(1, Math.max(0.25, parsed.musicScore?.intensity ?? 0.65)),
       },
       groundingSources,
-      moderation: audit.report,
+      groundedBrief,
+      isLiveGrounded: groundingSources.length > 0 || Boolean(groundedBrief),
+    };
+  } catch (err) {
+    if (isRateLimitError(err)) {
+      textCooldownUntilMs = Date.now() + 90_000;
+      if (options.throwOnUpstreamError) {
+        throw new Error(
+          'Gemini free-tier rate limit reached (429). Please wait a moment and try again.'
+        );
+      }
+    } else {
+      const readable = formatReadableAiError(err);
+      console.warn('[PleziDo TV] Gemini script draft fallback:', readable);
+      if (options.throwOnUpstreamError) {
+        throw new Error(readable || 'Unable to generate script with Gemini.');
+      }
+    }
+    return buildFallbackDraft({ ...options, nowMs });
+  }
+}
+
+export async function finalizeDraftToBroadcastSegment(
+  draft: DraftBroadcastScript,
+  options?: {
+    nowMs?: number;
+    requestedBy?: string;
+    skipAiProduction?: boolean;
+  }
+): Promise<BroadcastSegment> {
+  const nowMs = options?.nowMs ?? Date.now();
+  const segmentId = `seg-${crypto.randomUUID().slice(0, 8)}`;
+  const primaryHost = getHostById(draft.primaryHostId);
+  const coHost = draft.coHostId ? getHostById(draft.coHostId) : undefined;
+  const ai = options?.skipAiProduction ? null : getAiClient();
+
+  if (!ai) {
+    const { beats, totalDurationSec } = distributeBeatTimings(
+      draft.dialogueBeats,
+      primaryHost.id,
+      coHost?.id,
+      0,
+      draft.channel
+    );
+    const engineState: BroadcastEngineState = {
+      status: isGeminiConfigured() ? 'live-studio' : 'standby',
+      provider: 'gemini-free-tier',
+      note: isGeminiConfigured()
+        ? 'Gemini Free-Tier Live Studio Stage · Synchronized Score & Anchor Feed'
+        : 'Studio scene active · Set GEMINI_API_KEY in Secrets for live Gemini free-tier scripting & voice.',
+    };
+    return {
+      id: segmentId,
+      channel: draft.channel,
+      primaryHostId: primaryHost.id,
+      coHostId: coHost?.id,
+      showTitle: primaryHost.showTitle,
+      headline: draft.headline,
+      subheadline: draft.subheadline,
+      summary: draft.summary,
+      tickerItems: draft.tickerItems,
+      sceneCue: draft.sceneCue,
+      dialogueBeats: beats,
+      musicScore: draft.musicScore,
+      groundingSources: draft.groundingSources,
+      moderation: buildDefaultModerationReport(segmentId, draft.channel, draft.headline),
+      broadcastEngine: engineState,
       startedAtMs: nowMs,
       durationSec: totalDurationSec,
       endsAtMs: nowMs + totalDurationSec * 1000,
-      hasAudio,
-      audioUrl: hasAudio ? `/api/broadcast/audio/${segmentId}` : null,
-      isLiveGrounded: groundingSources.length > 0 || Boolean(groundedBrief),
-      requestedBy: options.requestedBy,
+      hasAudio: false,
+      audioUrl: null,
+      isLiveGrounded: draft.isLiveGrounded,
+      requestedBy: options?.requestedBy,
     };
-  } catch (err) {
-    console.error('[PleziDo TV] Segment generation error, using resilient fallback:', err);
-    return buildFallbackSegment(options, nowMs);
   }
+
+  // Step 1: Real-Time Pre-Broadcast Fact-Checking & Moderation Audit BEFORE TTS
+  const audit = await auditSegmentBeforeBroadcast(
+    segmentId,
+    draft.channel,
+    draft.headline,
+    draft.subheadline,
+    draft.dialogueBeats.map((b) => ({ speakerId: b.speakerId, text: b.text })),
+    draft.groundedBrief,
+    draft.groundingSources.length
+  );
+
+  const auditedRawBeats: RawAiSegmentPayload['dialogueBeats'] = draft.dialogueBeats.map((b, i) => ({
+    speakerId: b.speakerId,
+    text: audit.revisedBeats[i]?.text ?? b.text,
+    sceneAction: b.sceneAction,
+    cameraAngle: b.cameraAngle,
+  }));
+
+  // Step 2: Synthesize permanent host voice WAV audio via Gemini 3.8 Free-Tier TTS
+  const normalizedForTts = auditedRawBeats.map((b) => ({
+    speakerId: (coHost && b.speakerId === coHost.id ? coHost.id : primaryHost.id) as HostId,
+    text: b.text,
+  }));
+
+  const { hasAudio, durationSec: speechSec } = await synthesizeSegmentAudio(
+    ai,
+    segmentId,
+    primaryHost.id,
+    coHost?.id,
+    normalizedForTts
+  );
+
+  const { beats, totalDurationSec } = distributeBeatTimings(
+    auditedRawBeats,
+    primaryHost.id,
+    coHost?.id,
+    speechSec,
+    draft.channel
+  );
+
+  const broadcastEngine: BroadcastEngineState = {
+    status: hasAudio ? 'live-ai-broadcast' : 'live-studio',
+    provider: 'gemini-free-tier',
+    note: hasAudio
+      ? 'Gemini Free-Tier Live Broadcast · Voice TTS + Animated Studio Stage'
+      : 'Gemini Free-Tier Live Studio Stage · Script & Synchronized Score Active',
+  };
+
+  return {
+    id: segmentId,
+    channel: draft.channel,
+    primaryHostId: primaryHost.id,
+    coHostId: coHost?.id,
+    showTitle: primaryHost.showTitle,
+    headline: audit.headline,
+    subheadline: audit.subheadline,
+    summary: draft.summary,
+    tickerItems: draft.tickerItems,
+    sceneCue: draft.sceneCue,
+    dialogueBeats: beats,
+    musicScore: draft.musicScore,
+    groundingSources: draft.groundingSources,
+    moderation: audit.report,
+    broadcastEngine,
+    startedAtMs: nowMs,
+    durationSec: totalDurationSec,
+    endsAtMs: nowMs + totalDurationSec * 1000,
+    hasAudio,
+    audioUrl: hasAudio ? `/api/broadcast/audio/${segmentId}` : null,
+    isLiveGrounded: draft.isLiveGrounded,
+    requestedBy: options?.requestedBy,
+  };
+}
+
+export async function generateLiveBroadcastSegment(
+  options: GenerateSegmentOptions & { skipAiProduction?: boolean }
+): Promise<BroadcastSegment> {
+  const nowMs = options.nowMs ?? Date.now();
+  const format: ScriptFormat =
+    options.coHostId
+      ? 'live-debate'
+      : options.channel === 'news'
+        ? 'breaking-news'
+        : options.channel === 'music'
+          ? 'music-intro'
+          : 'editorial-essay';
+
+  const draft = options.skipAiProduction
+    ? buildFallbackDraft({
+        channel: options.channel,
+        primaryHostId: options.primaryHostId,
+        coHostId: options.coHostId,
+        format,
+        topic: options.requestedTopic || options.theme,
+        nowMs,
+      })
+    : await draftScriptWithGemini({
+        channel: options.channel,
+        primaryHostId: options.primaryHostId,
+        coHostId: options.coHostId,
+        format,
+        topic: options.requestedTopic || options.theme,
+        requestedBy: options.requestedBy,
+      });
+
+  return finalizeDraftToBroadcastSegment(draft, {
+    nowMs,
+    requestedBy: options.requestedBy,
+    skipAiProduction: options.skipAiProduction,
+  });
 }

@@ -4,8 +4,11 @@ import type {
   BroadcastSyncState,
   ChannelCategory,
   ChannelSelection,
+  DraftBroadcastScript,
+  HostId,
   ModerationReport,
   ScheduleSlot,
+  ScriptFormat,
   ViewerRequest,
 } from '../shared/broadcastTypes';
 import { broadcastAudioEngine } from './audio/broadcastAudioEngine';
@@ -14,6 +17,7 @@ import { EditorialModerationPanel } from './components/EditorialModerationPanel'
 import { HostsRoster } from './components/HostsRoster';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { ProgramGuide } from './components/ProgramGuide';
+import { ScriptWriterStudio } from './components/ScriptWriterStudio';
 import { TopNav } from './components/TopNav';
 
 export default function App() {
@@ -267,6 +271,47 @@ export default function App() {
     []
   );
 
+  const handleWriteScript = useCallback(
+    async (params: {
+      channel: ChannelCategory;
+      primaryHostId: HostId;
+      coHostId?: HostId;
+      format: ScriptFormat;
+      topic: string;
+    }): Promise<DraftBroadcastScript> => {
+      const res = await fetch('/api/broadcast/write-script', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(params),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        draft?: DraftBroadcastScript;
+        error?: string;
+      };
+      if (!res.ok || !data.draft) {
+        throw new Error(data.error || 'Failed to draft script with Gemini.');
+      }
+      return data.draft;
+    },
+    []
+  );
+
+  const handleAirScript = useCallback(
+    async (draft: DraftBroadcastScript, requestedBy?: string): Promise<void> => {
+      const res = await fetch('/api/broadcast/air-script', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ draft, requestedBy }),
+      });
+      const data = (await res.json().catch(() => ({}))) as { error?: string };
+      if (!res.ok) {
+        throw new Error(data.error || 'Failed to broadcast drafted script.');
+      }
+      setSelectedChannel('auto');
+    },
+    []
+  );
+
   return (
     <div className="min-h-screen bg-[#06080D] text-[#F4F6FA]">
       <TopNav audioEnabled={audioEnabled} onToggleAudio={handleToggleAudio} />
@@ -302,6 +347,14 @@ export default function App() {
               streamConnected={streamConnected}
               isProducingNext={broadcastState.isProducingNext}
               onProduceSegment={handleProduceSegment}
+            />
+
+            <ScriptWriterStudio
+              hosts={broadcastState.hosts}
+              geminiConfigured={broadcastState.geminiConfigured}
+              freeTierMode={broadcastState.freeTierMode}
+              onWriteScript={handleWriteScript}
+              onAirScript={handleAirScript}
             />
 
             <ProgramGuide

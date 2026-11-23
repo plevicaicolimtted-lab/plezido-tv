@@ -12,6 +12,16 @@ export type SynthPreset = 'ambient-pad' | 'warm-rhodes' | 'minimal-pulse' | 'dee
 
 export type ModerationVerdict = 'cleared' | 'cleared-with-caution' | 'flagged-revised' | 'blocked';
 
+export type ScriptFormat = 'breaking-news' | 'music-intro' | 'editorial-essay' | 'live-debate';
+
+export type BroadcastEngineStatus = 'live-ai-broadcast' | 'live-studio' | 'standby';
+
+export interface BroadcastEngineState {
+  status: BroadcastEngineStatus;
+  provider: 'gemini-free-tier';
+  note: string;
+}
+
 export interface ModerationReport {
   id: string;
   targetType: 'segment' | 'viewer-request';
@@ -81,6 +91,28 @@ export interface GroundingSource {
   url: string;
 }
 
+export interface DraftBroadcastScript {
+  channel: ChannelCategory;
+  primaryHostId: HostId;
+  coHostId?: HostId;
+  format: ScriptFormat;
+  headline: string;
+  subheadline: string;
+  summary: string;
+  tickerItems: string[];
+  sceneCue: SceneCue;
+  dialogueBeats: Array<{
+    speakerId: HostId;
+    text: string;
+    sceneAction: string;
+    cameraAngle: CameraAngle;
+  }>;
+  musicScore: MusicScore;
+  groundingSources: GroundingSource[];
+  groundedBrief: string;
+  isLiveGrounded: boolean;
+}
+
 export interface BroadcastSegment {
   id: string;
   channel: ChannelCategory;
@@ -96,6 +128,7 @@ export interface BroadcastSegment {
   musicScore: MusicScore;
   groundingSources: GroundingSource[];
   moderation: ModerationReport;
+  broadcastEngine: BroadcastEngineState;
   startedAtMs: number;
   durationSec: number;
   endsAtMs: number;
@@ -143,4 +176,6 @@ export interface BroadcastSyncState {
   recentSegments: BroadcastSegment[];
   nextTransitionAtMs: number;
   isProducingNext: boolean;
+  freeTierMode: boolean;
+  geminiConfigured: boolean;
 }

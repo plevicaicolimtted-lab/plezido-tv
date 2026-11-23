@@ -282,7 +282,7 @@ export function BroadcastStage({
                       } ${coHost ? 'w-44 sm:w-56' : 'w-52 sm:w-64'}`}
                       style={{ transform: `scale(${pulseScale})` }}
                     >
-                      <div className="aspect-square w-full overflow-hidden bg-[#141926]">
+                      <div className="relative aspect-square w-full overflow-hidden bg-[#141926]">
                         {!imgErrors[host.portraitUrl] ? (
                           <img
                             src={host.portraitUrl}
@@ -291,7 +291,9 @@ export function BroadcastStage({
                             onError={() =>
                               setImgErrors((prev) => ({ ...prev, [host.portraitUrl]: true }))
                             }
-                            className="h-full w-full object-cover"
+                            className={`h-full w-full object-cover transition-transform duration-700 ${
+                              isSpeaking ? 'scale-[1.03]' : 'scale-100'
+                            }`}
                           />
                         ) : (
                           <div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-[#1C2436] to-[#0B0F17] text-2xl font-display font-bold text-slate-300">
@@ -299,6 +301,25 @@ export function BroadcastStage({
                               .split(' ')
                               .map((n) => n[0])
                               .join('')}
+                          </div>
+                        )}
+                        {isSpeaking && (
+                          <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-end justify-end gap-0.5 bg-gradient-to-t from-black/70 via-black/20 to-transparent px-3 py-2">
+                            {[0.55, 0.9, 0.7, 1, 0.65].map((mult, barIdx) => {
+                              const barHeight = Math.max(
+                                4,
+                                Math.round(
+                                  (audioEnabled ? Math.max(0.2, voiceLevel) : 0.35) * 18 * mult
+                                )
+                              );
+                              return (
+                                <span
+                                  key={barIdx}
+                                  className="w-1 rounded-full bg-[#FB7185] transition-all duration-150"
+                                  style={{ height: `${barHeight}px` }}
+                                />
+                              );
+                            })}
                           </div>
                         )}
                       </div>
@@ -538,12 +559,31 @@ export function BroadcastStage({
 
         {/* Grounded Verification & Moderation Strip */}
         <div className="flex flex-col md:flex-row md:items-center justify-between gap-3 border-t border-white/[0.06] bg-[#0B0F17] px-5 py-3 text-xs text-slate-400">
-          <div className="flex items-start sm:items-center gap-2">
-            <ShieldCheck className="h-4 w-4 text-emerald-400 shrink-0 mt-0.5 sm:mt-0" aria-hidden="true" />
-            <span>
-              <strong className="font-medium text-slate-200">Editorial Gate:</strong>{' '}
-              {segment.moderation.notes}
+          <div className="flex flex-col sm:flex-row sm:items-center gap-2 sm:gap-4">
+            <div className="flex items-start sm:items-center gap-2">
+              <ShieldCheck className="h-4 w-4 text-emerald-400 shrink-0 mt-0.5 sm:mt-0" aria-hidden="true" />
+              <span>
+                <strong className="font-medium text-slate-200">Editorial Gate:</strong>{' '}
+                {segment.moderation.notes}
+              </span>
+            </div>
+            <span aria-hidden="true" className="hidden sm:inline text-slate-600">
+              ·
             </span>
+            <div className="flex items-start sm:items-center gap-2">
+              <Radio
+                className={`h-4 w-4 shrink-0 mt-0.5 sm:mt-0 ${
+                  segment.broadcastEngine.status === 'live-ai-broadcast'
+                    ? 'text-emerald-400'
+                    : 'text-slate-300'
+                }`}
+                aria-hidden="true"
+              />
+              <span>
+                <strong className="font-medium text-slate-200">Broadcast Engine:</strong>{' '}
+                {segment.broadcastEngine.note}
+              </span>
+            </div>
           </div>
 
           {segment.groundingSources.length > 0 && (

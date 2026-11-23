@@ -112,6 +112,80 @@ async function startServer() {
     }
   });
 
+  app.post('/api/broadcast/write-script', async (req, res) => {
+    try {
+      const { channel, primaryHostId, coHostId, format, topic } = req.body as {
+        channel?: ChannelCategory;
+        primaryHostId?: 'elena' | 'marcus' | 'sora';
+        coHostId?: 'elena' | 'marcus' | 'sora';
+        format?: 'breaking-news' | 'music-intro' | 'editorial-essay' | 'live-debate';
+        topic?: string;
+      };
+
+      const validChannel: ChannelCategory =
+        channel === 'news' || channel === 'music' || channel === 'culture'
+          ? channel
+          : 'news';
+      const validHost =
+        primaryHostId === 'elena' || primaryHostId === 'marcus' || primaryHostId === 'sora'
+          ? primaryHostId
+          : validChannel === 'news'
+            ? 'elena'
+            : validChannel === 'music'
+              ? 'marcus'
+              : 'sora';
+      const validFormat =
+        format === 'breaking-news' ||
+        format === 'music-intro' ||
+        format === 'editorial-essay' ||
+        format === 'live-debate'
+          ? format
+          : 'breaking-news';
+
+      const draft = await broadcastDirector.writeScriptDraft({
+        channel: validChannel,
+        primaryHostId: validHost,
+        coHostId:
+          coHostId && coHostId !== validHost ? coHostId : undefined,
+        format: validFormat,
+        topic: typeof topic === 'string' ? topic : '',
+      });
+
+      res.json({ draft });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unable to write script with Gemini';
+      const status = msg.includes('429') || msg.toLowerCase().includes('rate limit') ? 429 : 500;
+      res.status(status).json({
+        error: msg,
+      });
+    }
+  });
+
+  app.post('/api/broadcast/air-script', async (req, res) => {
+    try {
+      const { draft, requestedBy } = req.body as {
+        draft?: import('./shared/broadcastTypes.js').DraftBroadcastScript;
+        requestedBy?: string;
+      };
+
+      if (!draft || !draft.headline || !Array.isArray(draft.dialogueBeats) || draft.dialogueBeats.length === 0) {
+        res.status(400).json({ error: 'A valid script draft with at least one spoken line is required.' });
+        return;
+      }
+
+      const segment = await broadcastDirector.airDraftedScript(
+        draft,
+        typeof requestedBy === 'string' && requestedBy.trim() ? requestedBy.trim() : 'Producer Desk'
+      );
+
+      res.json({ segment });
+    } catch (err) {
+      res.status(500).json({
+        error: err instanceof Error ? err.message : 'Unable to broadcast script now',
+      });
+    }
+  });
+
   const httpServer = http.createServer(app);
 
   if (process.env.NODE_ENV !== 'production') {
@@ -129,10 +203,15 @@ async function startServer() {
         try {
           const result = await vite.transformRequest('/@vite/client');
           if (!result) return next();
-          const patched = result.code.replace(
-            /transport\.connect\(createHMRHandler\([^)]+\)\)/g,
-            'Promise.resolve()'
-          );
+          const patched = result.code
+            .replace(
+              /transport\.connect\(createHMRHandler\([^)]+\)\)/g,
+              'Promise.resolve()'
+            )
+            .replace(
+              /throw new SendBeforeConnectError\([^)]+\)/g,
+              'return'
+            );
           res.setHeader('Content-Type', 'application/javascript');
           res.send(patched);
         } catch (err) {

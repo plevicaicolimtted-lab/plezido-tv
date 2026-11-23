@@ -4,13 +4,20 @@ import type {
   BroadcastSegment,
   BroadcastSyncState,
   ChannelCategory,
+  DraftBroadcastScript,
   HostId,
   ModerationReport,
   ScheduleSlot,
+  ScriptFormat,
   ViewerRequest,
 } from '../shared/broadcastTypes.js';
 import { screenViewerRequest } from './contentModeration.js';
-import { generateLiveBroadcastSegment } from './geminiBroadcast.js';
+import {
+  draftScriptWithGemini,
+  finalizeDraftToBroadcastSegment,
+  generateLiveBroadcastSegment,
+  isGeminiConfigured,
+} from './geminiBroadcast.js';
 import { PERMANENT_HOSTS } from './hosts.js';
 
 interface HourBlockTemplate {
@@ -108,6 +115,7 @@ class BroadcastDirector {
   private heartbeatTimer: NodeJS.Timeout | null = null;
   private initialized = false;
   private subCycleIndex = 0;
+  private lastAiProductionAtMs = 0;
 
   public async initialize(): Promise<void> {
     if (this.initialized) return;
@@ -118,9 +126,28 @@ class BroadcastDirector {
 
     // Seed immediate baseline segments without waiting for external API latency on boot
     const [newsSeg, musicSeg, cultureSeg] = await Promise.all([
-      this.createSeedFallback('news', 'elena', undefined, 'Opening Global Desk Bulletin', nowMs),
-      this.createSeedFallback('music', 'marcus', undefined, 'Opening Analog Synthesis Set', nowMs),
-      this.createSeedFallback('culture', 'sora', 'elena', 'Opening Signal & Culture Roundtable', nowMs),
+      generateLiveBroadcastSegment({
+        channel: 'news',
+        primaryHostId: 'elena',
+        theme: 'Opening Global Desk Bulletin',
+        nowMs,
+        skipAiProduction: true,
+      }),
+      generateLiveBroadcastSegment({
+        channel: 'music',
+        primaryHostId: 'marcus',
+        theme: 'Opening Analog Synthesis Set',
+        nowMs,
+        skipAiProduction: true,
+      }),
+      generateLiveBroadcastSegment({
+        channel: 'culture',
+        primaryHostId: 'sora',
+        coHostId: 'elena',
+        theme: 'Opening Signal & Culture Roundtable',
+        nowMs,
+        skipAiProduction: true,
+      }),
     ]);
 
     this.channelSegments = {
@@ -134,32 +161,13 @@ class BroadcastDirector {
 
     this.startLoop();
 
-    // Immediately upgrade the live stream with a real Gemini-grounded + TTS-voiced segment
+    // Immediately upgrade the live stream with a real Gemini free-tier grounded + TTS-voiced segment
     void this.upgradeLiveBroadcastImmediately();
   }
 
-  private async createSeedFallback(
-    channel: ChannelCategory,
-    primaryHostId: HostId,
-    coHostId: HostId | undefined,
-    theme: string,
-    nowMs: number
-  ): Promise<BroadcastSegment> {
-    // Generate quickly using local fallback when GEMINI_API_KEY is absent, or fast initial seed
-    const prevKey = process.env.GEMINI_API_KEY;
-    process.env.GEMINI_API_KEY = '';
-    const seg = await generateLiveBroadcastSegment({
-      channel,
-      primaryHostId,
-      coHostId,
-      theme,
-      nowMs,
-    });
-    process.env.GEMINI_API_KEY = prevKey;
-    return seg;
-  }
-
   private async upgradeLiveBroadcastImmediately(): Promise<void> {
+    if (!isGeminiConfigured()) return;
+
     const nowMs = Date.now();
     const slot = getSlotForTimestamp(nowMs);
     this.isProducingNext = true;
@@ -174,28 +182,8 @@ class BroadcastDirector {
         nowMs,
       });
 
+      this.lastAiProductionAtMs = Date.now();
       this.activateSegment(liveSeg);
-
-      // Warm up the other two channel feeds gently in the background
-      const otherChannels: Array<{ ch: ChannelCategory; host: HostId; theme: string }> = [
-        { ch: 'news', host: 'elena', theme: 'Breaking World & Tech Headlines' },
-        { ch: 'music', host: 'marcus', theme: 'Ambient & Electronic Studio Session' },
-        { ch: 'culture', host: 'sora', theme: 'Design, Architecture & General Knowledge' },
-      ];
-
-      for (const item of otherChannels) {
-        if (item.ch !== slot.channel) {
-          const chSeg = await generateLiveBroadcastSegment({
-            channel: item.ch,
-            primaryHostId: item.host,
-            theme: item.theme,
-            nowMs: Date.now(),
-          });
-          this.channelSegments[item.ch] = chSeg;
-          this.recordModeration(chSeg.moderation);
-          this.broadcast({ type: 'channel:updated', channel: item.ch, segment: chSeg });
-        }
-      }
     } finally {
       this.isProducingNext = false;
       this.broadcast({ type: 'producing', isProducingNext: false });
@@ -223,12 +211,10 @@ class BroadcastDirector {
     const nowMs = Date.now();
     const remainingMs = this.activeNetworkSegment.endsAtMs - nowMs;
 
-    // Pre-produce the next segment 18 seconds before current segment ends
     if (remainingMs <= 18_000 && !this.preparedNextSegment && !this.isProducingNext) {
       void this.prepareNextSegment();
     }
 
-    // Transition exactly when current segment completes
     if (remainingMs <= 0) {
       if (this.preparedNextSegment) {
         const next = this.preparedNextSegment;
@@ -245,7 +231,6 @@ class BroadcastDirector {
           ready.endsAtMs = ready.startedAtMs + ready.durationSec * 1000;
           this.activateSegment(ready);
         } else {
-          // Extend gracefully if production failed
           this.activeNetworkSegment.startedAtMs = nowMs;
           this.activeNetworkSegment.endsAtMs = nowMs + this.activeNetworkSegment.durationSec * 1000;
         }
@@ -285,11 +270,15 @@ class BroadcastDirector {
         return;
       }
 
-      // Cycle cleanly across News, Music, Culture, and Dual-Host segments inside the 24/7 loop
       this.subCycleIndex = (this.subCycleIndex + 1) % HOUR_ROTATION.length;
       const currentSlot = getSlotForTimestamp(Date.now());
       const useSlot =
         this.subCycleIndex === 0 ? currentSlot : HOUR_ROTATION[this.subCycleIndex];
+
+      // Produce a fresh AI segment in background at most once every 3 minutes to respect free-tier quotas;
+      // viewer requests and manual studio productions always bypass this throttle.
+      const AUTO_AI_INTERVAL_MS = 3 * 60 * 1000;
+      const shouldUseAi = Date.now() - this.lastAiProductionAtMs >= AUTO_AI_INTERVAL_MS;
 
       const seg = await generateLiveBroadcastSegment({
         channel: useSlot.channel,
@@ -297,8 +286,12 @@ class BroadcastDirector {
         coHostId: useSlot.coHostId,
         theme: useSlot.theme,
         nowMs: Date.now(),
+        skipAiProduction: !shouldUseAi,
       });
 
+      if (shouldUseAi) {
+        this.lastAiProductionAtMs = Date.now();
+      }
       this.preparedNextSegment = seg;
     } finally {
       this.isProducingNext = false;
@@ -307,7 +300,6 @@ class BroadcastDirector {
   }
 
   private activateSegment(segment: BroadcastSegment): void {
-    // Mark any previous 'on-air' viewer request as 'aired'
     for (const item of this.queue) {
       if (item.status === 'on-air') {
         item.status = 'aired';
@@ -345,6 +337,39 @@ class BroadcastDirector {
     ].slice(0, 20);
   }
 
+  public async writeScriptDraft(options: {
+    channel: ChannelCategory;
+    primaryHostId: HostId;
+    coHostId?: HostId;
+    format: ScriptFormat;
+    topic: string;
+  }): Promise<DraftBroadcastScript> {
+    return draftScriptWithGemini({
+      ...options,
+      throwOnUpstreamError: true,
+    });
+  }
+
+  public async airDraftedScript(
+    draft: DraftBroadcastScript,
+    requestedBy?: string
+  ): Promise<BroadcastSegment> {
+    this.isProducingNext = true;
+    this.broadcast({ type: 'producing', isProducingNext: true });
+
+    try {
+      const seg = await finalizeDraftToBroadcastSegment(draft, {
+        nowMs: Date.now(),
+        requestedBy,
+      });
+      this.activateSegment(seg);
+      return seg;
+    } finally {
+      this.isProducingNext = false;
+      this.broadcast({ type: 'producing', isProducingNext: false });
+    }
+  }
+
   public async submitViewerRequest(
     topic: string,
     category: ChannelCategory,
@@ -374,7 +399,6 @@ class BroadcastDirector {
       moderationLog: this.moderationLog,
     });
 
-    // Trigger pre-production right away if nothing is preparing yet
     if (allowed && !this.preparedNextSegment && !this.isProducingNext) {
       void this.prepareNextSegment();
     }
@@ -431,6 +455,8 @@ class BroadcastDirector {
       recentSegments: this.recentSegments,
       nextTransitionAtMs: this.activeNetworkSegment.endsAtMs,
       isProducingNext: this.isProducingNext,
+      freeTierMode: true,
+      geminiConfigured: isGeminiConfigured(),
     };
   }
 

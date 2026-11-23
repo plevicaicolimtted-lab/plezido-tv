@@ -24,6 +24,12 @@ export function TopNav({ audioEnabled, onToggleAudio }: TopNavProps) {
             Live Stage
           </a>
           <a
+            href="#script-studio"
+            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
+          >
+            Script Studio
+          </a>
+          <a
             href="#program-guide"
             className="hover:text-white transition-colors whitespace-nowrap shrink-0"
           >
@@ -34,12 +40,6 @@ export function TopNav({ audioEnabled, onToggleAudio }: TopNavProps) {
             className="hover:text-white transition-colors whitespace-nowrap shrink-0"
           >
             Hosts
-          </a>
-          <a
-            href="#editorial-desk"
-            className="hover:text-white transition-colors whitespace-nowrap shrink-0"
-          >
-            Editorial Desk
           </a>
         </nav>
 
