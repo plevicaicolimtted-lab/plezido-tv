@@ -1,22 +1,32 @@
 import {
   Captions,
+  Download,
   ExternalLink,
+  ImagePlus,
   Music,
   Radio,
   RefreshCw,
+  RotateCcw,
   ShieldCheck,
+  Tv,
   Users,
+  Video,
   Volume2,
 } from 'lucide-react';
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState, type ChangeEvent } from 'react';
 import type {
   BroadcastSegment,
   ChannelCategory,
   ChannelSelection,
   DialogueBeat,
+  HostId,
   PermanentHost,
 } from '../../shared/broadcastTypes';
 import { broadcastAudioEngine } from '../audio/broadcastAudioEngine';
+import {
+  CartoonBroadcastStage,
+  type CartoonStylePreset,
+} from './CartoonBroadcastStage';
 import { PWAInstallButton } from './PWAInstallButton';
 
 interface BroadcastStageProps {
@@ -83,7 +93,40 @@ export function BroadcastStage({
   const [voiceLevel, setVoiceLevel] = useState(0);
   const [manualProducing, setManualProducing] = useState(false);
   const [imgErrors, setImgErrors] = useState<Record<string, boolean>>({});
+  const [visualMode, setVisualMode] = useState<'cartoon' | 'studio'>(() => {
+    try {
+      const saved = window.localStorage.getItem('plezido-visual-mode');
+      return saved === 'studio' ? 'studio' : 'cartoon';
+    } catch {
+      return 'cartoon';
+    }
+  });
+  const [cartoonStyle, setCartoonStyle] = useState<CartoonStylePreset>(() => {
+    try {
+      const saved = window.localStorage.getItem('plezido-cartoon-style');
+      if (saved === 'anime' || saved === 'lofi' || saved === 'cel') return saved;
+    } catch {
+      // Ignore storage errors
+    }
+    return 'cel';
+  });
+  const [customAvatars, setCustomAvatars] = useState<Partial<Record<HostId, string>>>(() => {
+    try {
+      const raw = window.localStorage.getItem('plezido-custom-avatars');
+      return raw ? (JSON.parse(raw) as Partial<Record<HostId, string>>) : {};
+    } catch {
+      return {};
+    }
+  });
+  const [isRecordingClip, setIsRecordingClip] = useState(false);
+  const [recordedClipUrl, setRecordedClipUrl] = useState<string | null>(null);
+  const [recordNotice, setRecordNotice] = useState<string | null>(null);
+
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const stageCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const avatarInputRef = useRef<HTMLInputElement | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
 
   useEffect(() => {
     const id = window.setInterval(() => {
@@ -186,13 +229,139 @@ export function BroadcastStage({
     }
   };
 
+  const handleVisualModeChange = (next: 'cartoon' | 'studio') => {
+    setVisualMode(next);
+    try {
+      window.localStorage.setItem('plezido-visual-mode', next);
+    } catch {
+      // Ignore storage failures
+    }
+  };
+
+  const handleCartoonStyleChange = (next: CartoonStylePreset) => {
+    setCartoonStyle(next);
+    try {
+      window.localStorage.setItem('plezido-cartoon-style', next);
+    } catch {
+      // Ignore storage failures
+    }
+  };
+
+  const handleAvatarUpload = (e: ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    e.target.value = '';
+    if (!file) return;
+    const reader = new FileReader();
+    reader.onload = () => {
+      if (typeof reader.result !== 'string') return;
+      const updated: Partial<Record<HostId, string>> = {
+        ...customAvatars,
+        [primaryHost.id]: reader.result,
+      };
+      setCustomAvatars(updated);
+      setVisualMode('cartoon');
+      try {
+        window.localStorage.setItem('plezido-visual-mode', 'cartoon');
+        window.localStorage.setItem('plezido-custom-avatars', JSON.stringify(updated));
+      } catch {
+        // Large data URL may exceed localStorage quota; keep in memory for session
+      }
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleResetAvatar = () => {
+    const updated = { ...customAvatars };
+    delete updated[primaryHost.id];
+    setCustomAvatars(updated);
+    try {
+      window.localStorage.setItem('plezido-custom-avatars', JSON.stringify(updated));
+    } catch {
+      // Ignore storage failures
+    }
+  };
+
+  const handleToggleRecordClip = async () => {
+    if (isRecordingClip && mediaRecorderRef.current) {
+      mediaRecorderRef.current.stop();
+      setIsRecordingClip(false);
+      return;
+    }
+
+    const stageCanvas = stageCanvasRef.current;
+    if (!stageCanvas || typeof stageCanvas.captureStream !== 'function' || typeof MediaRecorder === 'undefined') {
+      setRecordNotice('Video clip capture requires a modern desktop or mobile browser.');
+      return;
+    }
+
+    setRecordNotice(null);
+    if (recordedClipUrl) {
+      URL.revokeObjectURL(recordedClipUrl);
+      setRecordedClipUrl(null);
+    }
+
+    const videoStream = stageCanvas.captureStream(30);
+    const tracks: MediaStreamTrack[] = [...videoStream.getVideoTracks()];
+    if (audioEnabled) {
+      const audioStream = broadcastAudioEngine.getRecordingAudioStream();
+      if (audioStream) {
+        tracks.push(...audioStream.getAudioTracks());
+      }
+    }
+
+    const combinedStream = new MediaStream(tracks);
+    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+      ? 'video/webm;codecs=vp9,opus'
+      : MediaRecorder.isTypeSupported('video/webm')
+        ? 'video/webm'
+        : '';
+
+    try {
+      const recorder = mimeType
+        ? new MediaRecorder(combinedStream, { mimeType })
+        : new MediaRecorder(combinedStream);
+
+      recordedChunksRef.current = [];
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) {
+          recordedChunksRef.current.push(ev.data);
+        }
+      };
+      recorder.onstop = () => {
+        const blob = new Blob(recordedChunksRef.current, { type: mimeType || 'video/webm' });
+        const url = URL.createObjectURL(blob);
+        setRecordedClipUrl(url);
+        setIsRecordingClip(false);
+      };
+
+      mediaRecorderRef.current = recorder;
+      recorder.start(250);
+      setIsRecordingClip(true);
+    } catch {
+      setRecordNotice('Unable to start browser video capture in this browser context.');
+    }
+  };
+
   return (
     <section id="live-stage" className="mx-auto max-w-[1440px] px-4 sm:px-6 pt-6 pb-10">
       {/* 16:9 Broadcast Stage Frame */}
       <div className="relative overflow-hidden rounded-xl border border-white/[0.1] bg-[#0B0F17]">
         <div className="relative aspect-video w-full min-h-[380px] max-h-[680px] overflow-hidden bg-[#080B11]">
-          {/* Studio Scene Layer */}
-          {!imgErrors[primaryHost.studioSceneUrl] ? (
+          {/* Studio Scene Layer: Free Unlimited 60fps Cartoon Studio OR Studio Photo */}
+          {visualMode === 'cartoon' ? (
+            <CartoonBroadcastStage
+              segment={segment}
+              primaryHost={primaryHost}
+              coHost={coHost}
+              activeSpeakerId={activeSpeakerHost.id}
+              cameraAngle={cameraAngle}
+              audioEnabled={audioEnabled}
+              isInMusicInterlude={isInMusicInterlude}
+              stylePreset={cartoonStyle}
+              customAvatars={customAvatars}
+              canvasRefExternal={stageCanvasRef}
+            />
+          ) : !imgErrors[primaryHost.studioSceneUrl] ? (
             <img
               src={primaryHost.studioSceneUrl}
               alt={`${primaryHost.studioName} broadcast set`}
@@ -262,99 +431,102 @@ export function BroadcastStage({
           {/* Center Studio Stage: Host Frame(s) + Scene Graphic Card */}
           <div className="absolute inset-x-0 top-14 bottom-28 z-10 flex flex-col justify-center px-5 sm:px-8">
             <div className="grid grid-cols-1 lg:grid-cols-12 items-center gap-6">
-              {/* Permanent Host Anchor Frame(s) */}
+              {/* Permanent Host Anchor Frame(s) — hidden in Cartoon TV mode so the animated hosts on canvas take center stage */}
               <div className="lg:col-span-7 flex items-end gap-4">
-                {[primaryHost, ...(coHost ? [coHost] : [])].map((host) => {
-                  const isSpeaking =
-                    !isInMusicInterlude && activeSpeakerHost.id === host.id;
-                  const pulseScale =
-                    isSpeaking && audioEnabled
-                      ? 1 + Math.min(0.05, voiceLevel * 0.08)
-                      : 1;
+                {visualMode === 'studio' &&
+                  [primaryHost, ...(coHost ? [coHost] : [])].map((host) => {
+                    const isSpeaking =
+                      !isInMusicInterlude && activeSpeakerHost.id === host.id;
+                    const pulseScale =
+                      isSpeaking && audioEnabled
+                        ? 1 + Math.min(0.05, voiceLevel * 0.08)
+                        : 1;
 
-                  return (
-                    <div
-                      key={host.id}
-                      className={`relative overflow-hidden rounded-xl border transition-all duration-300 ${
-                        isSpeaking
-                          ? 'border-white/40 bg-[#0D121D]/90 shadow-2xl'
-                          : 'border-white/10 bg-[#0D121D]/70 opacity-75'
-                      } ${coHost ? 'w-44 sm:w-56' : 'w-52 sm:w-64'}`}
-                      style={{ transform: `scale(${pulseScale})` }}
-                    >
-                      <div className="relative aspect-square w-full overflow-hidden bg-[#141926]">
-                        {!imgErrors[host.portraitUrl] ? (
-                          <img
-                            src={host.portraitUrl}
-                            alt={host.name}
-                            referrerPolicy="no-referrer"
-                            onError={() =>
-                              setImgErrors((prev) => ({ ...prev, [host.portraitUrl]: true }))
-                            }
-                            className={`h-full w-full object-cover transition-transform duration-700 ${
-                              isSpeaking ? 'scale-[1.03]' : 'scale-100'
-                            }`}
-                          />
-                        ) : (
-                          <div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-[#1C2436] to-[#0B0F17] text-2xl font-display font-bold text-slate-300">
-                            {host.name
-                              .split(' ')
-                              .map((n) => n[0])
-                              .join('')}
-                          </div>
-                        )}
-                        {isSpeaking && (
-                          <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-end justify-end gap-0.5 bg-gradient-to-t from-black/70 via-black/20 to-transparent px-3 py-2">
-                            {[0.55, 0.9, 0.7, 1, 0.65].map((mult, barIdx) => {
-                              const barHeight = Math.max(
-                                4,
-                                Math.round(
-                                  (audioEnabled ? Math.max(0.2, voiceLevel) : 0.35) * 18 * mult
-                                )
-                              );
-                              return (
-                                <span
-                                  key={barIdx}
-                                  className="w-1 rounded-full bg-[#FB7185] transition-all duration-150"
-                                  style={{ height: `${barHeight}px` }}
-                                />
-                              );
-                            })}
-                          </div>
-                        )}
-                      </div>
-                      <div className="border-t border-white/10 px-3 py-2.5 bg-[#090C13]/95">
-                        <div className="flex items-center justify-between gap-2">
-                          <span className="text-xs font-semibold text-white truncate">
-                            {host.name}
-                          </span>
-                          <span
-                            className={`text-[11px] font-mono-tabular ${
-                              isSpeaking ? 'text-[#FB7185]' : 'text-slate-400'
-                            }`}
-                          >
-                            {isSpeaking ? 'SPEAKING' : 'ON SET'}
-                          </span>
+                    return (
+                      <div
+                        key={host.id}
+                        className={`relative overflow-hidden rounded-xl border transition-all duration-300 ${
+                          isSpeaking
+                            ? 'border-white/40 bg-[#0D121D]/90 shadow-2xl'
+                            : 'border-white/10 bg-[#0D121D]/70 opacity-75'
+                        } ${coHost ? 'w-44 sm:w-56' : 'w-52 sm:w-64'}`}
+                        style={{ transform: `scale(${pulseScale})` }}
+                      >
+                        <div className="relative aspect-square w-full overflow-hidden bg-[#141926]">
+                          {!imgErrors[host.portraitUrl] ? (
+                            <img
+                              src={host.portraitUrl}
+                              alt={host.name}
+                              referrerPolicy="no-referrer"
+                              onError={() =>
+                                setImgErrors((prev) => ({ ...prev, [host.portraitUrl]: true }))
+                              }
+                              className={`h-full w-full object-cover transition-transform duration-700 ${
+                                isSpeaking ? 'scale-[1.03]' : 'scale-100'
+                              }`}
+                            />
+                          ) : (
+                            <div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-[#1C2436] to-[#0B0F17] text-2xl font-display font-bold text-slate-300">
+                              {host.name
+                                .split(' ')
+                                .map((n) => n[0])
+                                .join('')}
+                            </div>
+                          )}
+                          {isSpeaking && (
+                            <div className="pointer-events-none absolute inset-x-0 bottom-0 flex items-end justify-end gap-0.5 bg-gradient-to-t from-black/70 via-black/20 to-transparent px-3 py-2">
+                              {[0.55, 0.9, 0.7, 1, 0.65].map((mult, barIdx) => {
+                                const barHeight = Math.max(
+                                  4,
+                                  Math.round(
+                                    (audioEnabled ? Math.max(0.2, voiceLevel) : 0.35) * 18 * mult
+                                  )
+                                );
+                                return (
+                                  <span
+                                    key={barIdx}
+                                    className="w-1 rounded-full bg-[#FB7185] transition-all duration-150"
+                                    style={{ height: `${barHeight}px` }}
+                                  />
+                                );
+                              })}
+                            </div>
+                          )}
                         </div>
-                        <p className="mt-0.5 text-[11px] text-slate-400 truncate">
-                          {host.personaTone}
-                        </p>
+                        <div className="border-t border-white/10 px-3 py-2.5 bg-[#090C13]/95">
+                          <div className="flex items-center justify-between gap-2">
+                            <span className="text-xs font-semibold text-white truncate">
+                              {host.name}
+                            </span>
+                            <span
+                              className={`text-[11px] font-mono-tabular ${
+                                isSpeaking ? 'text-[#FB7185]' : 'text-slate-400'
+                              }`}
+                            >
+                              {isSpeaking ? 'SPEAKING' : 'ON SET'}
+                            </span>
+                          </div>
+                          <p className="mt-0.5 text-[11px] text-slate-400 truncate">
+                            {host.personaTone}
+                          </p>
+                        </div>
                       </div>
-                    </div>
-                  );
-                })}
+                    );
+                  })}
 
                 {/* Scene Action Context Note */}
-                <div className="hidden sm:block max-w-xs pb-2">
-                  <p className="text-[11px] font-mono-tabular text-slate-400">
-                    Camera · {cameraAngle.replace('-', ' ')}
-                  </p>
-                  <p className="mt-1 text-xs leading-relaxed text-slate-300">
-                    {isInMusicInterlude
-                      ? `Live music showcase · ${segment.musicScore.title}`
-                      : activeBeat?.sceneAction || primaryHost.studioName}
-                  </p>
-                </div>
+                {visualMode === 'studio' && (
+                  <div className="hidden sm:block max-w-xs pb-2">
+                    <p className="text-[11px] font-mono-tabular text-slate-400">
+                      Camera · {cameraAngle.replace('-', ' ')}
+                    </p>
+                    <p className="mt-1 text-xs leading-relaxed text-slate-300">
+                      {isInMusicInterlude
+                        ? `Live music showcase · ${segment.musicScore.title}`
+                        : activeBeat?.sceneAction || primaryHost.studioName}
+                    </p>
+                  </div>
+                )}
               </div>
 
               {/* Right-Side Scene Graphic & Live Music Spectrum Card */}
@@ -554,6 +726,131 @@ export function BroadcastStage({
             </button>
 
             <PWAInstallButton />
+          </div>
+        </div>
+
+        {/* Visual Broadcast Mode & Avatar Customization Strip (Zero Billing, Unlimited) */}
+        <div className="flex flex-wrap items-center justify-between gap-3 border-t border-white/[0.06] bg-[#0C1018] px-5 py-2.5">
+          <div className="flex flex-wrap items-center gap-3">
+            <div className="inline-flex items-center gap-1 rounded-lg bg-[#070A10] p-1 border border-white/[0.06]">
+              <button
+                type="button"
+                onClick={() => handleVisualModeChange('cartoon')}
+                className={`inline-flex items-center gap-1.5 rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  visualMode === 'cartoon'
+                    ? 'bg-[#E11D48] text-white'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                <Tv className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>Cartoon TV Mode</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => handleVisualModeChange('studio')}
+                className={`rounded-md px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  visualMode === 'studio'
+                    ? 'bg-white/15 text-white'
+                    : 'text-slate-400 hover:text-white'
+                }`}
+              >
+                Studio Photos
+              </button>
+            </div>
+
+            {visualMode === 'cartoon' && (
+              <div className="inline-flex items-center gap-1 rounded-lg bg-[#070A10] p-1 border border-white/[0.06]">
+                {(
+                  [
+                    { id: 'cel', label: 'Broadcast Cel' },
+                    { id: 'anime', label: 'Anime Lounge' },
+                    { id: 'lofi', label: 'Retro Lo-Fi' },
+                  ] as Array<{ id: CartoonStylePreset; label: string }>
+                ).map((preset) => (
+                  <button
+                    key={preset.id}
+                    type="button"
+                    onClick={() => handleCartoonStyleChange(preset.id)}
+                    className={`rounded-md px-2.5 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                      cartoonStyle === preset.id
+                        ? 'bg-[#1E2638] text-white'
+                        : 'text-slate-400 hover:text-white'
+                    }`}
+                  >
+                    {preset.label}
+                  </button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="flex flex-wrap items-center gap-2.5">
+            <input
+              ref={avatarInputRef}
+              type="file"
+              accept="image/*"
+              onChange={handleAvatarUpload}
+              className="sr-only"
+              aria-label={`Upload custom avatar for ${primaryHost.name}`}
+            />
+
+            <button
+              type="button"
+              onClick={() => avatarInputRef.current?.click()}
+              className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-[#121722] px-3 py-1.5 text-xs font-medium text-slate-200 hover:bg-[#1A2232] transition-colors whitespace-nowrap shrink-0"
+            >
+              <ImagePlus className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Set {primaryHost.name.split(' ')[0]} Avatar</span>
+            </button>
+
+            {customAvatars[primaryHost.id] && (
+              <button
+                type="button"
+                onClick={handleResetAvatar}
+                className="inline-flex items-center gap-1.5 rounded-lg border border-white/10 px-2.5 py-1.5 text-xs font-medium text-slate-400 hover:text-white transition-colors whitespace-nowrap shrink-0"
+              >
+                <RotateCcw className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>Reset Avatar</span>
+              </button>
+            )}
+
+            {visualMode === 'cartoon' && (
+              <button
+                type="button"
+                onClick={() => void handleToggleRecordClip()}
+                className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  isRecordingClip
+                    ? 'border-[#E11D48] bg-[#E11D48]/20 text-white'
+                    : 'border-white/15 bg-[#121722] text-slate-200 hover:bg-[#1A2232]'
+                }`}
+              >
+                <Video className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>{isRecordingClip ? 'Stop Recording' : 'Record Video Clip'}</span>
+              </button>
+            )}
+
+            {recordedClipUrl && (
+              <a
+                href={recordedClipUrl}
+                download={`plezido-tv-${segment.id}.webm`}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 transition-colors whitespace-nowrap shrink-0"
+              >
+                <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>Save Video (.webm)</span>
+              </a>
+            )}
+
+            {recordNotice && (
+              <span className="text-xs text-amber-300">{recordNotice}</span>
+            )}
+
+            <a
+              href="/watch"
+              className="inline-flex items-center gap-1.5 rounded-lg border border-white/15 bg-[#161C29] px-3 py-1.5 text-xs font-semibold text-white hover:bg-[#1E2638] transition-colors whitespace-nowrap shrink-0"
+            >
+              <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+              <span>Open Viewer App</span>
+            </a>
           </div>
         </div>
 

@@ -18,6 +18,7 @@ export default defineConfig(() => {
           'pwa-192x192.png',
           'pwa-512x512.png',
           'pwa-maskable-512x512.png',
+          'viewer-manifest.webmanifest',
         ],
         manifest: {
           id: '/',
@@ -55,8 +56,12 @@ export default defineConfig(() => {
         },
         workbox: {
           globPatterns: ['**/*.{js,css,html,ico,png,svg,woff,woff2}'],
-          navigateFallbackDenylist: [/^\/api\//],
+          navigateFallbackDenylist: [/^\/api\//, /^\/watch/],
           runtimeCaching: [
+            {
+              urlPattern: ({ url }) => url.pathname.startsWith('/api/'),
+              handler: 'NetworkOnly',
+            },
             {
               urlPattern: /^https:\/\/fonts\.googleapis\.com\/.*/i,
               handler: 'CacheFirst',
@@ -108,12 +113,28 @@ export default defineConfig(() => {
           if (fs.existsSync(distDir) && fs.existsSync(srcAssets)) {
             fs.cpSync(srcAssets, distAssets, { recursive: true, force: true });
           }
+          const distWatchHtml = path.resolve(distDir, 'watch.html');
+          if (fs.existsSync(distWatchHtml)) {
+            const watchHtml = fs.readFileSync(distWatchHtml, 'utf8');
+            fs.writeFileSync(
+              distWatchHtml,
+              watchHtml.replace(/<link rel="manifest" href="\/manifest\.webmanifest">/g, '')
+            );
+          }
         },
       },
     ],
     resolve: {
       alias: {
         '@': path.resolve(__dirname, '.'),
+      },
+    },
+    build: {
+      rollupOptions: {
+        input: {
+          main: path.resolve(__dirname, 'index.html'),
+          watch: path.resolve(__dirname, 'watch.html'),
+        },
       },
     },
     server: {

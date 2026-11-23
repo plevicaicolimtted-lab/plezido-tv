@@ -929,7 +929,7 @@ export async function finalizeDraftToBroadcastSegment(
     text: b.text,
   }));
 
-  const { hasAudio, durationSec: speechSec } = await synthesizeSegmentAudio(
+  const { hasAudio, durationSec: speechSec, wavBuffer } = await synthesizeSegmentAudio(
     ai,
     segmentId,
     primaryHost.id,
@@ -953,6 +953,12 @@ export async function finalizeDraftToBroadcastSegment(
       : 'Gemini Free-Tier Live Studio Stage · Script & Synchronized Score Active',
   };
 
+  const inlineVercelAudio =
+    Boolean(process.env.VERCEL) &&
+    hasAudio &&
+    wavBuffer &&
+    wavBuffer.length <= 2_800_000;
+
   return {
     id: segmentId,
     channel: draft.channel,
@@ -973,7 +979,11 @@ export async function finalizeDraftToBroadcastSegment(
     durationSec: totalDurationSec,
     endsAtMs: nowMs + totalDurationSec * 1000,
     hasAudio,
-    audioUrl: hasAudio ? `/api/broadcast/audio/${segmentId}` : null,
+    audioUrl: hasAudio
+      ? inlineVercelAudio
+        ? `data:audio/wav;base64,${wavBuffer.toString('base64')}`
+        : `/api/broadcast/audio/${segmentId}`
+      : null,
     isLiveGrounded: draft.isLiveGrounded,
     requestedBy: options?.requestedBy,
   };

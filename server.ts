@@ -1,5 +1,6 @@
 import 'dotenv/config';
 import express from 'express';
+import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,17 +13,29 @@ const __dirname = path.dirname(__filename);
 
 async function startServer() {
   const app = express();
-  const PORT = 3000;
+  const PORT = Number(process.env.PORT) || 3000;
 
   app.use(express.json({ limit: '1mb' }));
+  app.use('/api', (req, res, next) => {
+    res.setHeader('Access-Control-Allow-Origin', '*');
+    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+    res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+    if (req.method === 'OPTIONS') {
+      res.status(204).end();
+      return;
+    }
+    next();
+  });
 
   await broadcastDirector.initialize();
 
   app.get('/api/health', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     res.json({ status: 'ok', serverTimeMs: Date.now() });
   });
 
   app.get('/api/broadcast/state', (_req, res) => {
+    res.setHeader('Cache-Control', 'no-store');
     res.json(broadcastDirector.getState());
   });
 
@@ -220,10 +233,27 @@ async function startServer() {
       });
     }
 
+    app.get(['/watch', '/watch.html', '/watch/*'], async (req, res, next) => {
+      try {
+        const watchHtmlPath = path.resolve(__dirname, 'watch.html');
+        const rawHtml = fs.readFileSync(watchHtmlPath, 'utf-8');
+        const transformed = (await vite.transformIndexHtml(req.originalUrl, rawHtml)).replace(
+          /<link rel="manifest" href="\/manifest\.webmanifest">/g,
+          ''
+        );
+        res.status(200).set({ 'Content-Type': 'text/html' }).end(transformed);
+      } catch (err) {
+        next(err);
+      }
+    });
+
     app.use(vite.middlewares);
   } else {
     const distPath = path.resolve(__dirname, 'dist');
     app.use(express.static(distPath));
+    app.get(['/watch', '/watch/*'], (_req, res) => {
+      res.sendFile(path.join(distPath, 'watch.html'));
+    });
     app.get('*', (_req, res) => {
       res.sendFile(path.join(distPath, 'index.html'));
     });

@@ -7,7 +7,6 @@ import type {
   DraftBroadcastScript,
   HostId,
   ModerationReport,
-  ScheduleSlot,
   ScriptFormat,
   ViewerRequest,
 } from '../shared/broadcastTypes.js';
@@ -19,88 +18,9 @@ import {
   isGeminiConfigured,
 } from './geminiBroadcast.js';
 import { PERMANENT_HOSTS } from './hosts.js';
+import { buildDailySchedule, getSlotForTimestamp, HOUR_ROTATION } from './schedule.js';
 
-interface HourBlockTemplate {
-  channel: ChannelCategory;
-  hostId: HostId;
-  coHostId?: HostId;
-  showTitle: string;
-  theme: string;
-}
-
-const HOUR_ROTATION: HourBlockTemplate[] = [
-  {
-    channel: 'news',
-    hostId: 'elena',
-    showTitle: 'Global Desk 24',
-    theme: 'World Headlines, Science & Tech Policy',
-  },
-  {
-    channel: 'music',
-    hostId: 'marcus',
-    showTitle: 'Frequency & Form',
-    theme: 'Continuous Generative Synth & Acoustic Study',
-  },
-  {
-    channel: 'culture',
-    hostId: 'sora',
-    coHostId: 'elena',
-    showTitle: 'Signal & Culture',
-    theme: 'Dual-Host Roundtable: Media, Cities & Emerging Tech',
-  },
-  {
-    channel: 'news',
-    hostId: 'elena',
-    showTitle: 'Global Desk 24',
-    theme: 'Global Markets, Infrastructure & Climate Brief',
-  },
-  {
-    channel: 'music',
-    hostId: 'marcus',
-    coHostId: 'sora',
-    showTitle: 'Frequency & Form',
-    theme: 'Music Trends & Generative Sound Dialogue',
-  },
-  {
-    channel: 'culture',
-    hostId: 'sora',
-    showTitle: 'Signal & Culture',
-    theme: 'Architecture, Cinema & General Knowledge Dispatch',
-  },
-];
-
-function pad2(n: number): string {
-  return String(n).padStart(2, '0');
-}
-
-export function buildDailySchedule(nowMs: number): ScheduleSlot[] {
-  const currentUtcHour = new Date(nowMs).getUTCHours();
-  const slots: ScheduleSlot[] = [];
-
-  for (let i = 0; i < 12; i++) {
-    const utcHour = (currentUtcHour + i) % 24;
-    const nextHour = (utcHour + 1) % 24;
-    const tpl = HOUR_ROTATION[utcHour % HOUR_ROTATION.length];
-    slots.push({
-      id: `slot-utc-${utcHour}`,
-      utcHour,
-      startLabelUtc: `${pad2(utcHour)}:00`,
-      endLabelUtc: `${pad2(nextHour)}:00`,
-      channel: tpl.channel,
-      hostId: tpl.hostId,
-      coHostId: tpl.coHostId,
-      showTitle: tpl.showTitle,
-      theme: tpl.theme,
-      isCurrent: i === 0,
-    });
-  }
-  return slots;
-}
-
-function getSlotForTimestamp(nowMs: number): HourBlockTemplate {
-  const utcHour = new Date(nowMs).getUTCHours();
-  return HOUR_ROTATION[utcHour % HOUR_ROTATION.length];
-}
+export { buildDailySchedule };
 
 class BroadcastDirector {
   private clients = new Set<Response>();
@@ -184,6 +104,11 @@ class BroadcastDirector {
 
       this.lastAiProductionAtMs = Date.now();
       this.activateSegment(liveSeg);
+    } catch (err) {
+      console.warn(
+        '[PleziDo TV] Initial live upgrade skipped, continuing baseline feed:',
+        err instanceof Error ? err.message : err
+      );
     } finally {
       this.isProducingNext = false;
       this.broadcast({ type: 'producing', isProducingNext: false });
@@ -208,33 +133,40 @@ class BroadcastDirector {
   }
 
   private async tickDirector(): Promise<void> {
-    const nowMs = Date.now();
-    const remainingMs = this.activeNetworkSegment.endsAtMs - nowMs;
+    try {
+      const nowMs = Date.now();
+      const remainingMs = this.activeNetworkSegment.endsAtMs - nowMs;
 
-    if (remainingMs <= 18_000 && !this.preparedNextSegment && !this.isProducingNext) {
-      void this.prepareNextSegment();
-    }
+      if (remainingMs <= 18_000 && !this.preparedNextSegment && !this.isProducingNext) {
+        void this.prepareNextSegment();
+      }
 
-    if (remainingMs <= 0) {
-      if (this.preparedNextSegment) {
-        const next = this.preparedNextSegment;
-        this.preparedNextSegment = null;
-        next.startedAtMs = nowMs;
-        next.endsAtMs = nowMs + next.durationSec * 1000;
-        this.activateSegment(next);
-      } else if (!this.isProducingNext) {
-        await this.prepareNextSegment();
-        const ready = this.preparedNextSegment as BroadcastSegment | null;
-        if (ready) {
+      if (remainingMs <= 0) {
+        if (this.preparedNextSegment) {
+          const next = this.preparedNextSegment;
           this.preparedNextSegment = null;
-          ready.startedAtMs = Date.now();
-          ready.endsAtMs = ready.startedAtMs + ready.durationSec * 1000;
-          this.activateSegment(ready);
-        } else {
-          this.activeNetworkSegment.startedAtMs = nowMs;
-          this.activeNetworkSegment.endsAtMs = nowMs + this.activeNetworkSegment.durationSec * 1000;
+          next.startedAtMs = nowMs;
+          next.endsAtMs = nowMs + next.durationSec * 1000;
+          this.activateSegment(next);
+        } else if (!this.isProducingNext) {
+          await this.prepareNextSegment();
+          const ready = this.preparedNextSegment as BroadcastSegment | null;
+          if (ready) {
+            this.preparedNextSegment = null;
+            ready.startedAtMs = Date.now();
+            ready.endsAtMs = ready.startedAtMs + ready.durationSec * 1000;
+            this.activateSegment(ready);
+          } else {
+            this.activeNetworkSegment.startedAtMs = nowMs;
+            this.activeNetworkSegment.endsAtMs = nowMs + this.activeNetworkSegment.durationSec * 1000;
+          }
         }
       }
+    } catch (err) {
+      console.warn(
+        '[PleziDo TV] Director tick recovered from error:',
+        err instanceof Error ? err.message : err
+      );
     }
   }
 
@@ -293,6 +225,11 @@ class BroadcastDirector {
         this.lastAiProductionAtMs = Date.now();
       }
       this.preparedNextSegment = seg;
+    } catch (err) {
+      console.warn(
+        '[PleziDo TV] Next segment preparation fallback:',
+        err instanceof Error ? err.message : err
+      );
     } finally {
       this.isProducingNext = false;
       this.broadcast({ type: 'producing', isProducingNext: false });

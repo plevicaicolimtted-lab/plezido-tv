@@ -41,6 +41,12 @@ export function TopNav({ audioEnabled, onToggleAudio }: TopNavProps) {
           >
             Hosts
           </a>
+          <a
+            href="/watch"
+            className="text-white hover:text-[#FB7185] transition-colors whitespace-nowrap shrink-0"
+          >
+            Viewer App
+          </a>
         </nav>
 
         <div className="flex items-center shrink-0">

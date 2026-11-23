@@ -1,4 +1,5 @@
 import type { BroadcastSegment, MusicScore, SynthPreset } from '../../shared/broadcastTypes';
+import { apiUrl } from '../lib/apiUrl';
 
 const NOTE_BASE_MIDI: Record<string, number> = {
   C: 48,
@@ -69,6 +70,7 @@ class BroadcastAudioEngine {
 
   private voiceFreqBins = new Uint8Array(32);
   private masterFreqBins = new Uint8Array(32);
+  private recordDest: MediaStreamAudioDestinationNode | null = null;
 
   private ensureContext(): AudioContext {
     if (!this.ctx) {
@@ -181,7 +183,7 @@ class BroadcastAudioEngine {
 
     const segIdAtRequest = segment.id;
     try {
-      const res = await fetch(segment.audioUrl);
+      const res = await fetch(apiUrl(segment.audioUrl));
       if (!res.ok) return;
       const arrayBuf = await res.arrayBuffer();
       if (!this.enabled || this.currentSegmentId !== segIdAtRequest) return;
@@ -347,6 +349,18 @@ class BroadcastAudioEngine {
       out.push(this.masterFreqBins[idx] / 255);
     }
     return out;
+  }
+
+  public getRecordingAudioStream(): MediaStream | null {
+    const ctx = this.ensureContext();
+    if (!this.masterGain || typeof ctx.createMediaStreamDestination !== 'function') {
+      return null;
+    }
+    if (!this.recordDest) {
+      this.recordDest = ctx.createMediaStreamDestination();
+      this.masterGain.connect(this.recordDest);
+    }
+    return this.recordDest.stream;
   }
 }
 

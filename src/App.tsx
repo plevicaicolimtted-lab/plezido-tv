@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { lazy, Suspense, useCallback, useEffect, useMemo, useState } from 'react';
 import type {
   BroadcastSegment,
   BroadcastSyncState,
@@ -19,41 +19,108 @@ import { OfflineIndicator } from './components/OfflineIndicator';
 import { ProgramGuide } from './components/ProgramGuide';
 import { ScriptWriterStudio } from './components/ScriptWriterStudio';
 import { TopNav } from './components/TopNav';
+import { apiUrl } from './lib/apiUrl';
+
+const LazyViewerApp = lazy(() => import('./viewer/ViewerApp'));
 
 export default function App() {
+  const isViewerRoute =
+    typeof window !== 'undefined' &&
+    (window.location.pathname === '/watch' || window.location.pathname.startsWith('/watch/'));
+
+  if (isViewerRoute) {
+    return (
+      <Suspense fallback={<div className="min-h-screen bg-[#06080D]" />}>
+        <LazyViewerApp />
+      </Suspense>
+    );
+  }
+
+  return <StudioApp />;
+}
+
+function StudioApp() {
   const [broadcastState, setBroadcastState] = useState<BroadcastSyncState | null>(null);
   const [selectedChannel, setSelectedChannel] = useState<ChannelSelection>('auto');
   const [audioEnabled, setAudioEnabled] = useState(false);
   const [volume, setVolume] = useState(0.8);
   const [clockOffsetMs, setClockOffsetMs] = useState(0);
   const [streamConnected, setStreamConnected] = useState(false);
+  const [statelessMode, setStatelessMode] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+
+  const applyLiveSegmentLocally = useCallback((seg: BroadcastSegment) => {
+    setBroadcastState((prev) => {
+      if (!prev) return prev;
+      return {
+        ...prev,
+        activeNetworkSegment: seg,
+        channelSegments: {
+          ...prev.channelSegments,
+          [seg.channel]: seg,
+        },
+        recentSegments: [
+          seg,
+          ...prev.recentSegments.filter((s) => s.id !== seg.id),
+        ].slice(0, 12),
+        moderationLog: [
+          seg.moderation,
+          ...prev.moderationLog.filter((r) => r.id !== seg.moderation.id),
+        ].slice(0, 20),
+        queue: prev.queue.map((q) =>
+          q.status === 'on-air'
+            ? { ...q, status: 'aired' }
+            : q.segmentId === seg.id
+              ? { ...q, status: 'on-air' }
+              : q
+        ),
+        nextTransitionAtMs: seg.endsAtMs,
+        isProducingNext: false,
+      };
+    });
+  }, []);
 
   useEffect(() => {
     let eventSource: EventSource | null = null;
     let reconnectTimer: number | null = null;
+    let retryStateTimer: number | null = null;
+    let attemptCount = 0;
+    let hydrated = false;
     let disposed = false;
 
     const hydrateInitial = async () => {
       try {
-        const res = await fetch('/api/broadcast/state');
+        const res = await fetch(apiUrl('/api/broadcast/state'), { cache: 'no-store' });
         if (!res.ok) throw new Error('Unable to reach PleziDo TV broadcast server');
         const data = (await res.json()) as BroadcastSyncState;
         if (!disposed) {
+          hydrated = true;
           setClockOffsetMs(data.serverTimeMs - Date.now());
-          setBroadcastState(data);
+          setBroadcastState((prev) => prev ?? data);
+          setStreamConnected(true);
           setLoadError(null);
         }
       } catch (err) {
-        if (!disposed) {
-          setLoadError(err instanceof Error ? err.message : 'Unable to connect to broadcast.');
+        if (disposed || hydrated) return;
+        attemptCount += 1;
+        // Wait through brief cold starts / server restarts before surfacing an error banner
+        if (attemptCount >= 3) {
+          setLoadError(
+            err instanceof Error ? err.message : 'Unable to reach PleziDo TV broadcast server'
+          );
         }
+        const delayMs = attemptCount === 1 ? 1200 : attemptCount === 2 ? 2000 : 4000;
+        retryStateTimer = window.setTimeout(() => {
+          retryStateTimer = null;
+          void hydrateInitial();
+        }, delayMs);
       }
     };
 
     const connectStream = () => {
       if (disposed) return;
-      eventSource = new EventSource('/api/broadcast/stream');
+      let isStatelessStream = false;
+      eventSource = new EventSource(apiUrl('/api/broadcast/stream'));
 
       eventSource.onopen = () => {
         if (!disposed) {
@@ -67,6 +134,7 @@ export default function App() {
         try {
           const msg = JSON.parse(evt.data) as {
             type: string;
+            mode?: 'stateless' | 'live';
             state?: BroadcastSyncState;
             segment?: BroadcastSegment;
             channel?: ChannelCategory;
@@ -82,8 +150,28 @@ export default function App() {
           };
 
           if (msg.type === 'init' && msg.state) {
+            if (msg.mode === 'stateless') {
+              isStatelessStream = true;
+              setStatelessMode(true);
+            }
+            hydrated = true;
+            if (retryStateTimer !== null) {
+              window.clearTimeout(retryStateTimer);
+              retryStateTimer = null;
+            }
             setClockOffsetMs(msg.state.serverTimeMs - Date.now());
-            setBroadcastState(msg.state);
+            setBroadcastState((prev) => prev ?? msg.state!);
+            setStreamConnected(true);
+            setLoadError(null);
+            return;
+          }
+
+          if (msg.type === 'clock:sync' && isStatelessStream) {
+            if (typeof msg.serverTimeMs === 'number') {
+              setClockOffsetMs(msg.serverTimeMs - Date.now());
+            }
+            eventSource?.close();
+            eventSource = null;
             return;
           }
 
@@ -144,7 +232,11 @@ export default function App() {
       };
 
       eventSource.onerror = () => {
-        if (disposed) return;
+        if (disposed || isStatelessStream) {
+          eventSource?.close();
+          eventSource = null;
+          return;
+        }
         setStreamConnected(false);
         eventSource?.close();
         eventSource = null;
@@ -166,8 +258,140 @@ export default function App() {
       if (reconnectTimer !== null) {
         window.clearTimeout(reconnectTimer);
       }
+      if (retryStateTimer !== null) {
+        window.clearTimeout(retryStateTimer);
+      }
     };
   }, []);
+
+  // Keep 24/7 broadcast rotating cleanly across UTC windows in stateless deployments (e.g. Vercel)
+  useEffect(() => {
+    if (!broadcastState) return;
+    const activeEndsAtMs = broadcastState.activeNetworkSegment.endsAtMs;
+    const activeSegId = broadcastState.activeNetworkSegment.id;
+    const graceMs = statelessMode ? 600 : 2500;
+    const waitMs = Math.max(800, activeEndsAtMs - (Date.now() + clockOffsetMs) + graceMs);
+
+    let cancelled = false;
+    const timer = window.setTimeout(async () => {
+      if (cancelled) return;
+
+      const queuedItem = statelessMode
+        ? broadcastState.queue.find((q) => q.status === 'queued')
+        : undefined;
+
+      if (queuedItem) {
+        setBroadcastState((prev) =>
+          prev
+            ? {
+                ...prev,
+                isProducingNext: true,
+                queue: prev.queue.map((q) =>
+                  q.id === queuedItem.id ? { ...q, status: 'producing' } : q
+                ),
+              }
+            : prev
+        );
+
+        try {
+          const res = await fetch(apiUrl('/api/broadcast/produce'), {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+              channel: queuedItem.category,
+              roundtable: false,
+              requestedTopic: queuedItem.topic,
+              requestedBy: queuedItem.requesterName,
+            }),
+          });
+          if (res.ok) {
+            const payload = (await res.json()) as { segment?: BroadcastSegment };
+            if (!cancelled && payload.segment) {
+              const liveSeg = payload.segment;
+              setBroadcastState((prev) =>
+                prev
+                  ? {
+                      ...prev,
+                      activeNetworkSegment: liveSeg,
+                      channelSegments: {
+                        ...prev.channelSegments,
+                        [liveSeg.channel]: liveSeg,
+                      },
+                      recentSegments: [
+                        liveSeg,
+                        ...prev.recentSegments.filter((s) => s.id !== liveSeg.id),
+                      ].slice(0, 12),
+                      moderationLog: [
+                        liveSeg.moderation,
+                        ...prev.moderationLog.filter((r) => r.id !== liveSeg.moderation.id),
+                      ].slice(0, 20),
+                      queue: prev.queue.map((q) =>
+                        q.id === queuedItem.id
+                          ? { ...q, status: 'on-air', segmentId: liveSeg.id }
+                          : q.status === 'on-air'
+                            ? { ...q, status: 'aired' }
+                            : q
+                      ),
+                      nextTransitionAtMs: liveSeg.endsAtMs,
+                      isProducingNext: false,
+                    }
+                  : prev
+              );
+              return;
+            }
+          }
+        } catch {
+          // Fall through to UTC state refresh below
+        }
+      }
+
+      try {
+        const res = await fetch(apiUrl('/api/broadcast/state'), { cache: 'no-store' });
+        if (!res.ok || cancelled) return;
+        const fresh = (await res.json()) as BroadcastSyncState;
+        if (cancelled) return;
+
+        setClockOffsetMs(fresh.serverTimeMs - Date.now());
+        setStreamConnected(true);
+        setBroadcastState((prev) => {
+          if (!prev) return fresh;
+          if (prev.activeNetworkSegment.id !== activeSegId) {
+            return prev;
+          }
+          return {
+            ...fresh,
+            queue:
+              prev.queue.length > 0
+                ? prev.queue.map((q) => (q.status === 'on-air' ? { ...q, status: 'aired' } : q))
+                : fresh.queue,
+            moderationLog: [
+              ...fresh.moderationLog,
+              ...prev.moderationLog.filter(
+                (r) => !fresh.moderationLog.some((fr) => fr.id === r.id)
+              ),
+            ].slice(0, 20),
+            recentSegments: [
+              fresh.activeNetworkSegment,
+              ...prev.recentSegments.filter((s) => s.id !== fresh.activeNetworkSegment.id),
+            ].slice(0, 12),
+          };
+        });
+      } catch {
+        // Keep current state cleanly if poll fails temporarily
+      }
+    }, waitMs);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timer);
+    };
+  }, [
+    broadcastState?.activeNetworkSegment.id,
+    broadcastState?.activeNetworkSegment.endsAtMs,
+    broadcastState?.queue,
+    clockOffsetMs,
+    statelessMode,
+  ]);
 
   const displayedSegment: BroadcastSegment | null = useMemo(() => {
     if (!broadcastState) return null;
@@ -222,18 +446,30 @@ export default function App() {
 
   const handleProduceSegment = useCallback(
     async (channel: ChannelCategory, roundtable: boolean) => {
-      const res = await fetch('/api/broadcast/produce', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ channel, roundtable }),
-      });
-      if (!res.ok) {
-        const errBody = (await res.json().catch(() => ({}))) as { error?: string };
-        throw new Error(errBody.error || 'Failed to produce live segment');
+      setBroadcastState((prev) => (prev ? { ...prev, isProducingNext: true } : prev));
+      try {
+        const res = await fetch(apiUrl('/api/broadcast/produce'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ channel, roundtable }),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          segment?: BroadcastSegment;
+          error?: string;
+        };
+        if (!res.ok) {
+          throw new Error(data.error || 'Failed to produce live segment');
+        }
+        if (data.segment) {
+          applyLiveSegmentLocally(data.segment);
+        }
+        setSelectedChannel('auto');
+      } catch (err) {
+        setBroadcastState((prev) => (prev ? { ...prev, isProducingNext: false } : prev));
+        throw err;
       }
-      setSelectedChannel('auto');
     },
-    []
+    [applyLiveSegmentLocally]
   );
 
   const handleSubmitRequest = useCallback(
@@ -242,16 +478,35 @@ export default function App() {
       category: ChannelCategory,
       requesterName: string
     ): Promise<{ accepted: boolean; message: string }> => {
-      const res = await fetch('/api/broadcast/request', {
+      const res = await fetch(apiUrl('/api/broadcast/request'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ topic, category, requesterName }),
       });
-      const data = (await res.json()) as {
+      const data = (await res.json().catch(() => ({}))) as {
         accepted?: boolean;
+        request?: ViewerRequest;
         report?: ModerationReport;
         error?: string;
       };
+
+      if (data.request || data.report) {
+        setBroadcastState((prev) => {
+          if (!prev) return prev;
+          return {
+            ...prev,
+            queue: data.request
+              ? [data.request, ...prev.queue.filter((q) => q.id !== data.request!.id)].slice(0, 18)
+              : prev.queue,
+            moderationLog: data.report
+              ? [
+                  data.report,
+                  ...prev.moderationLog.filter((r) => r.id !== data.report!.id),
+                ].slice(0, 20)
+              : prev.moderationLog,
+          };
+        });
+      }
 
       if (res.status === 422 && data.report) {
         return {
@@ -279,7 +534,7 @@ export default function App() {
       format: ScriptFormat;
       topic: string;
     }): Promise<DraftBroadcastScript> => {
-      const res = await fetch('/api/broadcast/write-script', {
+      const res = await fetch(apiUrl('/api/broadcast/write-script'), {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(params),
@@ -298,18 +553,30 @@ export default function App() {
 
   const handleAirScript = useCallback(
     async (draft: DraftBroadcastScript, requestedBy?: string): Promise<void> => {
-      const res = await fetch('/api/broadcast/air-script', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ draft, requestedBy }),
-      });
-      const data = (await res.json().catch(() => ({}))) as { error?: string };
-      if (!res.ok) {
-        throw new Error(data.error || 'Failed to broadcast drafted script.');
+      setBroadcastState((prev) => (prev ? { ...prev, isProducingNext: true } : prev));
+      try {
+        const res = await fetch(apiUrl('/api/broadcast/air-script'), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ draft, requestedBy }),
+        });
+        const data = (await res.json().catch(() => ({}))) as {
+          segment?: BroadcastSegment;
+          error?: string;
+        };
+        if (!res.ok) {
+          throw new Error(data.error || 'Failed to broadcast drafted script.');
+        }
+        if (data.segment) {
+          applyLiveSegmentLocally(data.segment);
+        }
+        setSelectedChannel('auto');
+      } catch (err) {
+        setBroadcastState((prev) => (prev ? { ...prev, isProducingNext: false } : prev));
+        throw err;
       }
-      setSelectedChannel('auto');
     },
-    []
+    [applyLiveSegmentLocally]
   );
 
   return (
@@ -319,8 +586,15 @@ export default function App() {
       <main>
         {loadError && !broadcastState && (
           <div className="mx-auto max-w-[1440px] px-4 sm:px-6 pt-8">
-            <div className="rounded-xl border border-rose-500/30 bg-rose-500/10 p-5 text-sm text-rose-200">
-              {loadError}
+            <div className="flex flex-wrap items-center justify-between gap-4 rounded-xl border border-rose-500/30 bg-rose-500/10 p-5 text-sm text-rose-200">
+              <span>{loadError} · Retrying automatically…</span>
+              <button
+                type="button"
+                onClick={() => window.location.reload()}
+                className="rounded-lg border border-rose-400/40 bg-rose-500/20 px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-rose-500/30 transition-colors"
+              >
+                Reconnect Now
+              </button>
             </div>
           </div>
         )}
