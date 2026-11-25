@@ -5,13 +5,18 @@ import type {
   BroadcastSyncState,
   ChannelCategory,
   ChannelSelection,
+  HostId,
   ModerationReport,
   ScheduleSlot,
   ViewerRequest,
 } from '../../shared/broadcastTypes';
 import { broadcastAudioEngine } from '../audio/broadcastAudioEngine';
+import { BroadcastArchiveSection } from '../components/BroadcastArchiveSection';
 import { OfflineIndicator } from '../components/OfflineIndicator';
 import { ProgramGuide } from '../components/ProgramGuide';
+import { PWAInstallButton } from '../components/PWAInstallButton';
+import { TalkativeAiHostPanel } from '../components/TalkativeAiHostPanel';
+import { useFirebase } from '../contexts/FirebaseContext';
 import {
   apiUrl,
   getConfiguredFallbackApiBase,
@@ -20,6 +25,8 @@ import {
 import { ViewerStage } from './ViewerStage';
 
 export default function ViewerApp() {
+  const { user, profile, persistedRequests, saveBroadcastRequest, updatePreferences } =
+    useFirebase();
   const [broadcastState, setBroadcastState] = useState<BroadcastSyncState | null>(null);
   const [selectedChannel, setSelectedChannel] = useState<ChannelSelection>('auto');
   const [audioEnabled, setAudioEnabled] = useState(false);
@@ -28,6 +35,7 @@ export default function ViewerApp() {
   const [streamConnected, setStreamConnected] = useState(false);
   const [statelessMode, setStatelessMode] = useState(false);
   const [loadError, setLoadError] = useState<string | null>(null);
+  const [liveVoiceHost, setLiveVoiceHost] = useState<HostId | null>(null);
 
   // Viewer topic / song request state
   const [topic, setTopic] = useState('');
@@ -311,10 +319,83 @@ export default function ViewerApp() {
     broadcastAudioEngine.setVolume(next);
   }, []);
 
-  const handleTuneChannel = useCallback((channel: ChannelSelection) => {
-    setSelectedChannel(channel);
-    document.getElementById('watch-live')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+  useEffect(() => {
+    if (profile?.preferredChannel) {
+      setSelectedChannel(profile.preferredChannel);
+    }
+  }, [profile?.preferredChannel]);
+
+  const handleSelectChannel = useCallback(
+    (channel: ChannelSelection) => {
+      setSelectedChannel(channel);
+      if (user) {
+        void updatePreferences({ preferredChannel: channel }).catch(() => undefined);
+      }
+    },
+    [updatePreferences, user]
+  );
+
+  const handleTuneChannel = useCallback(
+    (channel: ChannelSelection) => {
+      handleSelectChannel(channel);
+      document.getElementById('watch-live')?.scrollIntoView({ behavior: 'smooth', block: 'start' });
+    },
+    [handleSelectChannel]
+  );
+
+  const handleHostSpeakingChange = useCallback((speaking: boolean, hostId: HostId) => {
+    setLiveVoiceHost(speaking ? hostId : null);
+    broadcastAudioEngine.setExternalHostSpeaking(speaking);
   }, []);
+
+  const submitTopicToShow = useCallback(
+    async (topicText: string, reqCategory: ChannelCategory, nameText: string) => {
+      const res = await fetch(apiUrl('/api/broadcast/request'), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          topic: topicText.trim(),
+          category: reqCategory,
+          requesterName: nameText.trim() || user?.displayName?.split(' ')[0] || 'Viewer',
+        }),
+      });
+      const data = (await res.json().catch(() => ({}))) as {
+        accepted?: boolean;
+        request?: ViewerRequest;
+        report?: ModerationReport;
+        error?: string;
+      };
+
+      if (data.request) {
+        setBroadcastState((prev) =>
+          prev
+            ? {
+                ...prev,
+                queue: [data.request!, ...prev.queue.filter((q) => q.id !== data.request!.id)].slice(
+                  0,
+                  18
+                ),
+              }
+            : prev
+        );
+      }
+
+      if (user && data.request) {
+        void saveBroadcastRequest(
+          data.request,
+          data.report?.notes || 'Screened by PleziDo TV editorial desk'
+        ).catch(() => undefined);
+      }
+
+      if (res.status === 422 && data.report) {
+        throw new Error(`Topic not accepted: ${data.report.notes}`);
+      }
+      if (!res.ok) {
+        throw new Error(data.error || 'Unable to submit request right now.');
+      }
+    },
+    [saveBroadcastRequest, user]
+  );
 
   const handleViewerRequest = async (e: FormEvent) => {
     e.preventDefault();
@@ -329,36 +410,13 @@ export default function ViewerApp() {
     setSubmitting(true);
     setRequestFeedback(null);
     try {
-      const res = await fetch(apiUrl('/api/broadcast/request'), {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          topic: topic.trim(),
-          category,
-          requesterName: requesterName.trim() || 'Viewer',
-        }),
-      });
-      const data = (await res.json().catch(() => ({}))) as {
-        accepted?: boolean;
-        report?: ModerationReport;
-        error?: string;
-      };
-
-      if (res.status === 422 && data.report) {
-        setRequestFeedback({
-          ok: false,
-          text: `Topic not accepted: ${data.report.notes}`,
-        });
-        return;
-      }
-      if (!res.ok) {
-        throw new Error(data.error || 'Unable to submit request right now.');
-      }
-
+      await submitTopicToShow(topic, category, requesterName);
       setTopic('');
       setRequestFeedback({
         ok: true,
-        text: 'Topic submitted to the PleziDo TV broadcast queue.',
+        text: user
+          ? 'Topic submitted and saved to the PleziDo TV Firestore queue.'
+          : 'Topic submitted to the PleziDo TV broadcast queue.',
       });
     } catch (err) {
       setRequestFeedback({
@@ -369,6 +427,13 @@ export default function ViewerApp() {
       setSubmitting(false);
     }
   };
+
+  const mergedQueue = useMemo(() => {
+    const liveQueue = broadcastState?.queue ?? [];
+    if (persistedRequests.length === 0) return liveQueue;
+    const seen = new Set(liveQueue.map((q) => q.id));
+    return [...liveQueue, ...persistedRequests.filter((p) => !seen.has(p.id))].slice(0, 12);
+  }, [broadcastState?.queue, persistedRequests]);
 
   return (
     <div className="min-h-screen bg-[#06080D] text-[#F4F6FA]">
@@ -396,20 +461,27 @@ export default function ViewerApp() {
               Channels
             </a>
             <a
+              href="#talk-ai"
+              className="hover:text-white transition-colors whitespace-nowrap shrink-0"
+            >
+              Talk to Hosts
+            </a>
+            <a
               href="#program-guide"
               className="hover:text-white transition-colors whitespace-nowrap shrink-0"
             >
               TV Guide
             </a>
             <a
-              href="#viewer-request"
+              href="#database-archive"
               className="hover:text-white transition-colors whitespace-nowrap shrink-0"
             >
-              Request Topic
+              Saved Shows
             </a>
           </nav>
 
-          <div className="flex items-center shrink-0">
+          <div className="flex items-center gap-2.5 shrink-0">
+            <PWAInstallButton labelOverride="Download PleziDo TV" />
             <button
               type="button"
               onClick={handleToggleAudio}
@@ -463,7 +535,7 @@ export default function ViewerApp() {
               segment={displayedSegment}
               hosts={broadcastState.hosts}
               selectedChannel={selectedChannel}
-              onSelectChannel={setSelectedChannel}
+              onSelectChannel={handleSelectChannel}
               audioEnabled={audioEnabled}
               onEnableAudio={() => void handleEnableAudio()}
               volume={volume}
@@ -471,6 +543,7 @@ export default function ViewerApp() {
               clockOffsetMs={clockOffsetMs}
               viewerCount={broadcastState.viewerCount}
               streamConnected={streamConnected}
+              liveVoiceHost={liveVoiceHost}
             />
 
             {/* Channels Now Airing Strip */}
@@ -523,6 +596,23 @@ export default function ViewerApp() {
               </div>
             </section>
 
+            <TalkativeAiHostPanel
+              hosts={broadcastState.hosts}
+              activeChannel={displayedSegment.channel}
+              onTuneChannel={handleTuneChannel}
+              onHostSpeakingChange={handleHostSpeakingChange}
+              onSendTopicToShow={async (suggestedTopic, hostId) => {
+                const targetChannel: ChannelCategory =
+                  hostId === 'elena' ? 'news' : hostId === 'marcus' ? 'music' : 'culture';
+                await submitTopicToShow(suggestedTopic, targetChannel, requesterName || 'Viewer');
+              }}
+            />
+
+            <BroadcastArchiveSection
+              currentSegment={displayedSegment}
+              onTuneChannel={handleTuneChannel}
+            />
+
             <ProgramGuide
               schedule={broadcastState.schedule}
               hosts={broadcastState.hosts}
@@ -534,7 +624,8 @@ export default function ViewerApp() {
               id="viewer-request"
               className="mx-auto max-w-[1440px] px-4 sm:px-6 py-10 border-t border-white/[0.08]"
             >
-              <div className="max-w-2xl rounded-xl border border-white/[0.08] bg-[#0B0F17] p-6 sm:p-8">
+              <div className="grid grid-cols-1 lg:grid-cols-12 gap-6 items-start">
+                <div className="lg:col-span-7 rounded-xl border border-white/[0.08] bg-[#0B0F17] p-6 sm:p-8">
                 <div className="flex items-center gap-2 text-xs font-medium text-slate-400">
                   <Tv className="h-4 w-4 text-[#E11D48]" aria-hidden="true" />
                   <span>Audience Requests</span>
@@ -626,6 +717,38 @@ export default function ViewerApp() {
                     )}
                   </div>
                 </form>
+                </div>
+
+                <div className="lg:col-span-5 rounded-xl border border-white/[0.08] bg-[#0B0F17] overflow-hidden">
+                  <div className="flex items-center justify-between border-b border-white/[0.08] bg-[#0F131C] px-5 py-3.5">
+                    <span className="text-sm font-semibold text-white">Up Next on PleziDo TV</span>
+                    <span className="text-xs font-mono-tabular text-slate-400">
+                      {mergedQueue.length} Queued
+                    </span>
+                  </div>
+                  {mergedQueue.length === 0 ? (
+                    <div className="p-6 text-xs text-slate-400">
+                      No audience requests in line right now. Submit a topic or send one straight
+                      from your AI Host chat!
+                    </div>
+                  ) : (
+                    <div className="divide-y divide-white/[0.06] max-h-[300px] overflow-y-auto">
+                      {mergedQueue.slice(0, 6).map((item) => (
+                        <div key={item.id} className="px-5 py-3.5">
+                          <div className="flex items-center justify-between gap-2 text-[11px] text-slate-400">
+                            <span className="capitalize font-medium text-slate-200">
+                              {item.category} · {item.requesterName}
+                            </span>
+                            <span className="font-mono-tabular uppercase text-[#FB7185]">
+                              {item.status}
+                            </span>
+                          </div>
+                          <p className="mt-1 text-xs text-slate-300 line-clamp-2">{item.topic}</p>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
               </div>
             </section>
           </>
@@ -635,7 +758,12 @@ export default function ViewerApp() {
       <footer className="border-t border-white/[0.08] bg-[#05070B] py-8 pb-[max(2rem,env(safe-area-inset-bottom))]">
         <div className="mx-auto flex max-w-[1440px] flex-col sm:flex-row items-start sm:items-center justify-between gap-4 px-4 sm:px-6 text-xs text-slate-500">
           <p>PleziDo TV Viewer App · Watch Live 24/7 on iPhone, Android, Windows &amp; Linux</p>
-          <p>Synchronized to UTC Wall Clock</p>
+          <div className="flex items-center gap-4">
+            <a href="/" className="text-slate-300 hover:text-white transition-colors">
+              Open Studio Producer
+            </a>
+            <span>Synchronized to UTC Wall Clock</span>
+          </div>
         </div>
       </footer>
 

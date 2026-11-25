@@ -1,0 +1,330 @@
+{
+  "entities": {
+    "UserProfile": {
+      "title": "UserProfile",
+      "description": "Publicly scoped viewer and producer preferences for PleziDo TV without PII.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "displayName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "preferredChannel": {
+          "type": "string",
+          "enum": ["auto", "news", "music", "culture"]
+        },
+        "cartoonStyle": {
+          "type": "string",
+          "enum": ["cel", "anime", "lofi"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["uid", "displayName", "preferredChannel", "cartoonStyle", "createdAt", "updatedAt"]
+    },
+    "ViewerFavorite": {
+      "title": "ViewerFavorite",
+      "description": "Saved broadcast segment bookmark under a user profile.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "segmentId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "headline": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 180
+        },
+        "channel": {
+          "type": "string",
+          "enum": ["news", "music", "culture"]
+        },
+        "showTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "userId", "segmentId", "headline", "channel", "showTitle", "createdAt"]
+    },
+    "TalkMessage": {
+      "title": "TalkMessage",
+      "description": "Free-tier conversational turn between a viewer/producer and a PleziDo TV AI host.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "userId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "hostId": {
+          "type": "string",
+          "enum": ["elena", "marcus", "sora"]
+        },
+        "role": {
+          "type": "string",
+          "enum": ["user", "host"]
+        },
+        "text": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 1200
+        },
+        "channel": {
+          "type": "string",
+          "enum": ["news", "music", "culture"]
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": ["id", "userId", "hostId", "role", "text", "channel", "createdAt"]
+    },
+    "BroadcastRequest": {
+      "title": "BroadcastRequest",
+      "description": "Audience topic or musical vibe request stored in Firestore with moderation status.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "authorId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "requesterName": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 40
+        },
+        "category": {
+          "type": "string",
+          "enum": ["news", "music", "culture"]
+        },
+        "topic": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 180
+        },
+        "status": {
+          "type": "string",
+          "enum": ["queued", "producing", "on-air", "aired", "flagged"]
+        },
+        "isPublicQueue": {
+          "type": "boolean"
+        },
+        "moderationNotes": {
+          "type": "string",
+          "maxLength": 300
+        },
+        "segmentId": {
+          "type": "string",
+          "maxLength": 64
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "authorId",
+        "requesterName",
+        "category",
+        "topic",
+        "status",
+        "isPublicQueue",
+        "moderationNotes",
+        "createdAt",
+        "updatedAt"
+      ]
+    },
+    "SavedSegment": {
+      "title": "SavedSegment",
+      "description": "Archived PleziDo TV broadcast segment saved for replay and network history.",
+      "type": "object",
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "authorId": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "channel": {
+          "type": "string",
+          "enum": ["news", "music", "culture"]
+        },
+        "primaryHostId": {
+          "type": "string",
+          "enum": ["elena", "marcus", "sora"]
+        },
+        "coHostId": {
+          "type": "string",
+          "maxLength": 16
+        },
+        "showTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 80
+        },
+        "headline": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 180
+        },
+        "subheadline": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 220
+        },
+        "summary": {
+          "type": "string",
+          "maxLength": 500
+        },
+        "dialogueText": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 2500
+        },
+        "musicTitle": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 100
+        },
+        "musicBpm": {
+          "type": "number"
+        },
+        "verdict": {
+          "type": "string",
+          "enum": ["cleared", "cleared-with-caution", "flagged-revised", "blocked"]
+        },
+        "isLiveGrounded": {
+          "type": "boolean"
+        },
+        "isPublicArchive": {
+          "type": "boolean"
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time"
+        }
+      },
+      "required": [
+        "id",
+        "authorId",
+        "channel",
+        "primaryHostId",
+        "showTitle",
+        "headline",
+        "subheadline",
+        "summary",
+        "dialogueText",
+        "musicTitle",
+        "musicBpm",
+        "verdict",
+        "isLiveGrounded",
+        "isPublicArchive",
+        "createdAt"
+      ]
+    },
+    "AdminMember": {
+      "title": "AdminMember",
+      "description": "Trusted administrator lookup record managed out-of-band.",
+      "type": "object",
+      "properties": {
+        "uid": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 128,
+          "pattern": "^[a-zA-Z0-9_\\-]+$"
+        },
+        "role": {
+          "type": "string",
+          "enum": ["admin"]
+        }
+      },
+      "required": ["uid", "role"]
+    }
+  },
+  "firestore": {
+    "/userProfiles/{userId}": {
+      "schema": { "$ref": "#/entities/UserProfile" },
+      "description": "User broadcast preferences and display name"
+    },
+    "/userProfiles/{userId}/favorites/{favoriteId}": {
+      "schema": { "$ref": "#/entities/ViewerFavorite" },
+      "description": "Saved broadcast bookmarks belonging to a user profile"
+    },
+    "/userProfiles/{userId}/talkMessages/{messageId}": {
+      "schema": { "$ref": "#/entities/TalkMessage" },
+      "description": "Conversational talk-radio/TV history with free-tier AI hosts"
+    },
+    "/broadcastRequests/{requestId}": {
+      "schema": { "$ref": "#/entities/BroadcastRequest" },
+      "description": "Moderated audience topic and music requests"
+    },
+    "/savedSegments/{segmentId}": {
+      "schema": { "$ref": "#/entities/SavedSegment" },
+      "description": "Persisted broadcast segment archive for replay and history"
+    },
+    "/admins/{adminId}": {
+      "schema": { "$ref": "#/entities/AdminMember" },
+      "description": "Trusted producer/admin identity records"
+    }
+  }
+}

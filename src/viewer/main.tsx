@@ -1,4 +1,6 @@
 import { createRoot } from 'react-dom/client';
+import { ErrorBoundary } from '../components/ErrorBoundary';
+import { FirebaseProvider } from '../contexts/FirebaseContext';
 import '../index.css';
 import ViewerApp from './ViewerApp';
 
@@ -8,4 +10,10 @@ if (import.meta.env.PROD && 'serviceWorker' in navigator) {
   });
 }
 
-createRoot(document.getElementById('viewer-root')!).render(<ViewerApp />);
+createRoot(document.getElementById('viewer-root')!).render(
+  <ErrorBoundary>
+    <FirebaseProvider>
+      <ViewerApp />
+    </FirebaseProvider>
+  </ErrorBoundary>
+);

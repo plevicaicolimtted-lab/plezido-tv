@@ -242,30 +242,58 @@ async function synthesizeSegmentAudio(
       }
     } else {
       const combinedScript = beats.map((b) => b.text).join(' ');
-      const ttsResponse = await ai.models.generateContent({
-        model: 'gemini-3.8-flash-lite-tts',
-        contents: [
-          {
-            role: 'user',
-            parts: [
-              {
-                text: combinedScript,
-                speechMetadata: {
-                  style: primaryHost.voiceStyle,
+      let ttsResponse;
+      try {
+        ttsResponse = await ai.models.generateContent({
+          model: 'gemini-3.8-flash-tts',
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: combinedScript,
+                  speechMetadata: {
+                    style: primaryHost.voiceStyle,
+                  },
                 },
+              ],
+            },
+          ],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: primaryHost.voiceName },
               },
-            ],
-          },
-        ],
-        config: {
-          responseModalities: ['AUDIO'],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: { voiceName: primaryHost.voiceName },
             },
           },
-        },
-      });
+        });
+      } catch {
+        ttsResponse = await ai.models.generateContent({
+          model: 'gemini-3.8-flash-lite-tts',
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: combinedScript,
+                  speechMetadata: {
+                    style: primaryHost.voiceStyle,
+                  },
+                },
+              ],
+            },
+          ],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: primaryHost.voiceName },
+              },
+            },
+          },
+        });
+      }
 
       const base64Audio =
         ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
@@ -642,7 +670,7 @@ Permanent Host Personas:
 ${hostProfiles}
 
 Rules:
-- Write 3 to 4 crisp, broadcast-ready spoken dialogueBeats totaling ~70 to 110 words total (natural spoken cadence, no stage directions inside spoken text, no markdown).
+- Write 4 to 6 lively, talkative, broadcast-ready spoken dialogueBeats totaling ~95 to 145 words total (natural spoken cadence, back-and-forth energy, no stage directions inside spoken text, no markdown).
 - Stick strictly to verified facts in the Grounded Facts above; never invent fake stats or quotes.
 - ${coHostDirective}
 - Specify accurate studio sceneAction and cameraAngle ('wide-studio' | 'anchor-closeup' | 'split-graphics') for each beat so camera cuts match the spoken moment.
@@ -1026,3 +1054,187 @@ export async function generateLiveBroadcastSegment(
     skipAiProduction: options.skipAiProduction,
   });
 }
+
+export interface TalkWithHostInput {
+  hostId: HostId;
+  message: string;
+  history?: Array<{ role: 'user' | 'host'; text: string }>;
+  withVoice?: boolean;
+}
+
+export interface TalkWithHostResult {
+  hostId: HostId;
+  hostName: string;
+  channel: ChannelCategory;
+  replyText: string;
+  audioDataUrl: string | null;
+  groundingSources: GroundingSource[];
+  suggestedFollowUp: string;
+  freeTierModel: string;
+  voiceModel?: string;
+}
+
+export async function talkWithAiHost(
+  input: TalkWithHostInput
+): Promise<TalkWithHostResult> {
+  const host = getHostById(input.hostId);
+  const cleanMessage = input.message.trim().slice(0, 600);
+  const recentHistory = (input.history ?? [])
+    .slice(-8)
+    .map((m) => `${m.role === 'user' ? 'Viewer' : host.name}: ${m.text.slice(0, 400)}`)
+    .join('\n');
+
+  const ai = getAiClient();
+  if (!ai) {
+    return {
+      hostId: host.id,
+      hostName: host.name,
+      channel: host.channel,
+      replyText: `Welcome into ${host.studioName}! I am ${host.name}. You asked about "${cleanMessage}"—we are standing by on our live free-tier studio feed. Set GEMINI_API_KEY in Vercel or AI Studio Secrets to unlock real-time Search-grounded dialogue and my live voice.`,
+      audioDataUrl: null,
+      groundingSources: [],
+      suggestedFollowUp: 'What live story or studio vibe should we cover next?',
+      freeTierModel: 'standby',
+    };
+  }
+
+  let groundingSources: GroundingSource[] = [];
+  let replyText = '';
+  let usedModel = 'gemini-4-hydrogen';
+
+  const systemInstruction = `You are ${host.name}, permanent TV host of "${host.showTitle}" on PleziDo TV (${host.studioName}).
+Persona tone: ${host.personaTone}. Expertise: ${host.expertise}. Traits: ${host.personaTraits.join(', ')}.
+Speak naturally, warmly, and enthusiastically as an expressive live television host chatting directly with a viewer or producer in real time (3 to 5 lively spoken sentences, conversational, zero markdown bullets or asterisks).
+If the question touches current events, facts, or music/video craft, use verified knowledge and keep it engaging and upbeat.`;
+
+  const prompt = `${recentHistory ? `Recent studio conversation:\n${recentHistory}\n\n` : ''}Viewer / Producer says: "${cleanMessage}"\nReply directly in character as ${host.name} (natural spoken words only, no markdown):`;
+
+  const client = ai;
+  try {
+    const attempts: Array<() => Promise<{ response: Awaited<ReturnType<typeof client.models.generateContent>>; model: string }>> = [
+      async () => ({
+        model: 'gemini-4-hydrogen',
+        response: await client.models.generateContent({
+          model: 'gemini-4-hydrogen',
+          contents: prompt,
+          config: {
+            systemInstruction,
+            thinkingConfig: { thinkingLevel: ThinkingLevel.LOW },
+            tools: [{ googleSearch: {} }],
+          },
+        }),
+      }),
+      async () => ({
+        model: 'gemini-3.1-flash-lite',
+        response: await client.models.generateContent({
+          model: 'gemini-3.1-flash-lite',
+          contents: prompt,
+          config: { systemInstruction },
+        }),
+      }),
+      async () => {
+        await new Promise((r) => setTimeout(r, 900));
+        return {
+          model: 'gemini-3.1-flash-lite',
+          response: await client.models.generateContent({
+            model: 'gemini-3.1-flash-lite',
+            contents: prompt,
+            config: { systemInstruction },
+          }),
+        };
+      },
+    ];
+
+    let finalResponse: Awaited<ReturnType<typeof client.models.generateContent>> | null = null;
+    let lastErr: unknown = null;
+
+    for (const runAttempt of attempts) {
+      try {
+        const res = await runAttempt();
+        finalResponse = res.response;
+        usedModel = res.model;
+        break;
+      } catch (attemptErr) {
+        lastErr = attemptErr;
+      }
+    }
+
+    if (!finalResponse) {
+      throw lastErr;
+    }
+
+    replyText = (finalResponse.text ?? '').trim();
+    groundingSources = extractGroundingSources(finalResponse);
+  } catch (err) {
+    const readable = formatReadableAiError(err);
+    throw new Error(readable || 'Unable to reach Gemini free-tier host chat right now.');
+  }
+
+  if (!replyText) {
+    replyText = `Thanks for tuning into ${host.showTitle}! Tell me more about what you want to explore next on PleziDo TV.`;
+  }
+
+  let audioDataUrl: string | null = null;
+  let voiceModel = 'browser-speech';
+  if (input.withVoice !== false && Date.now() >= ttsCooldownUntilMs) {
+    const ttsCandidates: Array<'gemini-3.8-flash-tts' | 'gemini-3.8-flash-lite-tts'> = [
+      'gemini-3.8-flash-tts',
+      'gemini-3.8-flash-lite-tts',
+    ];
+    for (const ttsModel of ttsCandidates) {
+      try {
+        const ttsResponse = await ai.models.generateContent({
+          model: ttsModel,
+          contents: [
+            {
+              role: 'user',
+              parts: [
+                {
+                  text: replyText.slice(0, 900),
+                  speechMetadata: { style: host.voiceStyle },
+                },
+              ],
+            },
+          ],
+          config: {
+            responseModalities: ['AUDIO'],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: { voiceName: host.voiceName },
+              },
+            },
+          },
+        });
+        const base64Audio =
+          ttsResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+        if (base64Audio) {
+          audioDataUrl = `data:audio/wav;base64,${base64Audio}`;
+          voiceModel = ttsModel;
+          break;
+        }
+      } catch (ttsErr) {
+        if (isRateLimitError(ttsErr)) {
+          ttsCooldownUntilMs = Date.now() + 90_000;
+        }
+      }
+    }
+  }
+
+  return {
+    hostId: host.id,
+    hostName: host.name,
+    channel: host.channel,
+    replyText,
+    audioDataUrl,
+    groundingSources,
+    suggestedFollowUp:
+      host.channel === 'news'
+        ? 'Ask Elena for a deeper breakdown or turn this into a live bulletin.'
+        : host.channel === 'music'
+          ? 'Ask Marcus for a matching chord mood or BPM shift.'
+          : 'Ask Sora how this shapes upcoming cartoon and video shows.',
+    freeTierModel: usedModel,
+    voiceModel,
+  };
+}
+

@@ -1,11 +1,13 @@
 import {
   Captions,
+  Download,
   ExternalLink,
   Maximize2,
   Minimize2,
   Music,
   Radio,
   Tv,
+  Video,
   Volume2,
 } from 'lucide-react';
 import { useEffect, useMemo, useRef, useState } from 'react';
@@ -13,6 +15,7 @@ import type {
   BroadcastSegment,
   ChannelSelection,
   DialogueBeat,
+  HostId,
   PermanentHost,
 } from '../../shared/broadcastTypes';
 import { broadcastAudioEngine } from '../audio/broadcastAudioEngine';
@@ -21,6 +24,7 @@ import {
   type CartoonStylePreset,
 } from '../components/CartoonBroadcastStage';
 import { PWAInstallButton } from '../components/PWAInstallButton';
+import { useFirebase } from '../contexts/FirebaseContext';
 
 interface ViewerStageProps {
   segment: BroadcastSegment;
@@ -34,6 +38,7 @@ interface ViewerStageProps {
   clockOffsetMs: number;
   viewerCount: number;
   streamConnected: boolean;
+  liveVoiceHost?: HostId | null;
 }
 
 function formatClockTime(ms: number, useUtc: boolean): string {
@@ -63,7 +68,9 @@ export function ViewerStage({
   clockOffsetMs,
   viewerCount,
   streamConnected,
+  liveVoiceHost = null,
 }: ViewerStageProps) {
+  const { user, profile, updatePreferences } = useFirebase();
   const [nowMs, setNowMs] = useState<number>(() => Date.now() + clockOffsetMs);
   const [captionsEnabled, setCaptionsEnabled] = useState(true);
   const [voiceLevel, setVoiceLevel] = useState(0);
@@ -86,9 +93,46 @@ export function ViewerStage({
     }
     return 'cel';
   });
+  const [customAvatars, setCustomAvatars] = useState<Partial<Record<HostId, string>>>(() => {
+    try {
+      const raw = window.localStorage.getItem('plezido-custom-avatars');
+      return raw ? (JSON.parse(raw) as Partial<Record<HostId, string>>) : {};
+    } catch {
+      return {};
+    }
+  });
+
+  const [isRecordingClip, setIsRecordingClip] = useState(false);
+  const [recordedClipUrl, setRecordedClipUrl] = useState<string | null>(null);
+  const [recordNotice, setRecordNotice] = useState<string | null>(null);
 
   const playerFrameRef = useRef<HTMLDivElement | null>(null);
   const spectrumCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const stageCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const recordedChunksRef = useRef<Blob[]>([]);
+
+  useEffect(() => {
+    if (profile?.cartoonStyle) {
+      setCartoonStyle(profile.cartoonStyle);
+    }
+  }, [profile?.cartoonStyle]);
+
+  useEffect(() => {
+    const onStorage = (e: StorageEvent) => {
+      if (e.key === 'plezido-custom-avatars') {
+        try {
+          setCustomAvatars(
+            e.newValue ? (JSON.parse(e.newValue) as Partial<Record<HostId, string>>) : {}
+          );
+        } catch {
+          // Ignore malformed avatar storage
+        }
+      }
+    };
+    window.addEventListener('storage', onStorage);
+    return () => window.removeEventListener('storage', onStorage);
+  }, []);
 
   useEffect(() => {
     const id = window.setInterval(() => {
@@ -203,6 +247,9 @@ export function ViewerStage({
     } catch {
       // Ignore storage errors
     }
+    if (user) {
+      void updatePreferences({ cartoonStyle: next }).catch(() => undefined);
+    }
   };
 
   const handleToggleFullscreen = async () => {
@@ -212,6 +259,71 @@ export function ViewerStage({
       await el.requestFullscreen?.().catch(() => undefined);
     } else {
       await document.exitFullscreen?.().catch(() => undefined);
+    }
+  };
+
+  const handleToggleRecordClip = () => {
+    if (isRecordingClip && mediaRecorderRef.current) {
+      mediaRecorderRef.current.stop();
+      setIsRecordingClip(false);
+      return;
+    }
+
+    const stageCanvas = stageCanvasRef.current;
+    if (
+      !stageCanvas ||
+      typeof stageCanvas.captureStream !== 'function' ||
+      typeof MediaRecorder === 'undefined'
+    ) {
+      setRecordNotice('Video clip download requires Cartoon TV mode in a modern browser.');
+      return;
+    }
+
+    setRecordNotice(null);
+    if (recordedClipUrl) {
+      URL.revokeObjectURL(recordedClipUrl);
+      setRecordedClipUrl(null);
+    }
+
+    const videoStream = stageCanvas.captureStream(30);
+    const tracks: MediaStreamTrack[] = [...videoStream.getVideoTracks()];
+    if (audioEnabled) {
+      const audioStream = broadcastAudioEngine.getRecordingAudioStream();
+      if (audioStream) {
+        tracks.push(...audioStream.getAudioTracks());
+      }
+    }
+
+    const combinedStream = new MediaStream(tracks);
+    const mimeType = MediaRecorder.isTypeSupported('video/webm;codecs=vp9,opus')
+      ? 'video/webm;codecs=vp9,opus'
+      : MediaRecorder.isTypeSupported('video/webm')
+        ? 'video/webm'
+        : '';
+
+    try {
+      const recorder = mimeType
+        ? new MediaRecorder(combinedStream, { mimeType })
+        : new MediaRecorder(combinedStream);
+
+      recordedChunksRef.current = [];
+      recorder.ondataavailable = (ev) => {
+        if (ev.data && ev.data.size > 0) {
+          recordedChunksRef.current.push(ev.data);
+        }
+      };
+      recorder.onstop = () => {
+        const blob = new Blob(recordedChunksRef.current, { type: mimeType || 'video/webm' });
+        const url = URL.createObjectURL(blob);
+        setRecordedClipUrl(url);
+        setIsRecordingClip(false);
+      };
+
+      mediaRecorderRef.current = recorder;
+      recorder.start(250);
+      setIsRecordingClip(true);
+    } catch {
+      setRecordNotice('Unable to record clip in this browser context.');
     }
   };
 
@@ -227,12 +339,13 @@ export function ViewerStage({
               segment={segment}
               primaryHost={primaryHost}
               coHost={coHost}
-              activeSpeakerId={activeSpeakerHost.id}
+              activeSpeakerId={liveVoiceHost || activeSpeakerHost.id}
               cameraAngle={cameraAngle}
-              audioEnabled={audioEnabled}
-              isInMusicInterlude={isInMusicInterlude}
+              audioEnabled={audioEnabled || Boolean(liveVoiceHost)}
+              isInMusicInterlude={!liveVoiceHost && isInMusicInterlude}
               stylePreset={cartoonStyle}
-              customAvatars={{}}
+              customAvatars={customAvatars}
+              canvasRefExternal={stageCanvasRef}
             />
           ) : !imgErrors[primaryHost.studioSceneUrl] ? (
             <img
@@ -275,6 +388,16 @@ export function ViewerStage({
               <span className="hidden sm:inline font-mono-tabular text-slate-300">
                 {viewerCount} watching
               </span>
+              {liveVoiceHost && (
+                <>
+                  <span aria-hidden="true" className="text-slate-500">
+                    ·
+                  </span>
+                  <span className="font-mono-tabular text-emerald-300">
+                    Voice Call Active
+                  </span>
+                </>
+              )}
             </div>
 
             <div className="flex items-center gap-3 text-xs text-slate-200">
@@ -584,6 +707,36 @@ export function ViewerStage({
               <Captions className="h-3.5 w-3.5" aria-hidden="true" />
               <span>{captionsEnabled ? 'Captions On' : 'Captions Off'}</span>
             </button>
+
+            {visualMode === 'cartoon' && (
+              <button
+                type="button"
+                onClick={handleToggleRecordClip}
+                className={`inline-flex items-center gap-1.5 rounded-lg border px-3 py-1.5 text-xs font-medium transition-colors whitespace-nowrap shrink-0 ${
+                  isRecordingClip
+                    ? 'border-[#E11D48] bg-[#E11D48]/20 text-white'
+                    : 'border-white/15 bg-[#121722] text-slate-200 hover:bg-[#1A2232]'
+                }`}
+              >
+                <Video className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>{isRecordingClip ? 'Stop Clip' : 'Record Clip'}</span>
+              </button>
+            )}
+
+            {recordedClipUrl && (
+              <a
+                href={recordedClipUrl}
+                download={`plezido-tv-${segment.id}.webm`}
+                className="inline-flex items-center gap-1.5 rounded-lg bg-emerald-600 px-3 py-1.5 text-xs font-semibold text-white hover:bg-emerald-500 transition-colors whitespace-nowrap shrink-0"
+              >
+                <Download className="h-3.5 w-3.5" aria-hidden="true" />
+                <span>Download Video (.webm)</span>
+              </a>
+            )}
+
+            {recordNotice && (
+              <span className="text-xs text-amber-300">{recordNotice}</span>
+            )}
 
             <PWAInstallButton />
           </div>

@@ -1,5 +1,6 @@
 import type { BroadcastSegment, MusicScore, SynthPreset } from '../../shared/broadcastTypes';
 import { apiUrl } from '../lib/apiUrl';
+import { speakWithBrowserVoice, stopBrowserVoice } from '../lib/browserSpeech';
 
 const NOTE_BASE_MIDI: Record<string, number> = {
   C: 48,
@@ -71,6 +72,8 @@ class BroadcastAudioEngine {
   private voiceFreqBins = new Uint8Array(32);
   private masterFreqBins = new Uint8Array(32);
   private recordDest: MediaStreamAudioDestinationNode | null = null;
+  private browserSpeechActive = false;
+  private externalHostSpeaking = false;
 
   private ensureContext(): AudioContext {
     if (!this.ctx) {
@@ -164,20 +167,64 @@ class BroadcastAudioEngine {
       }
       this.currentVoiceSource = null;
     }
+    if (this.browserSpeechActive) {
+      stopBrowserVoice();
+      this.browserSpeechActive = false;
+    }
     this.isVoicePlaying = false;
     this.duckMusic(false);
+  }
+
+  public setExternalHostSpeaking(active: boolean): void {
+    this.externalHostSpeaking = active;
+    if (active) {
+      this.stopVoice();
+    }
+    this.duckMusic(this.isVoicePlaying);
   }
 
   private duckMusic(voiceActive: boolean): void {
     if (!this.ctx || !this.musicGain || !this.currentScore) return;
     const baseLevel = Math.min(0.65, Math.max(0.25, this.currentScore.intensity * 0.65));
-    const target = voiceActive ? baseLevel * 0.28 : baseLevel;
-    this.musicGain.gain.setTargetAtTime(target, this.ctx.currentTime, 0.25);
+    const target = this.externalHostSpeaking
+      ? 0.04
+      : voiceActive
+        ? baseLevel * 0.28
+        : baseLevel;
+    this.musicGain.gain.setTargetAtTime(target, this.ctx.currentTime, 0.2);
   }
 
   private async playSegmentVoice(segment: BroadcastSegment, offsetSec: number): Promise<void> {
     this.stopVoice();
-    if (!segment.hasAudio || !segment.audioUrl || !this.enabled) {
+    if (!this.enabled || this.externalHostSpeaking) {
+      return;
+    }
+
+    if (!segment.hasAudio || !segment.audioUrl) {
+      const spokenText = segment.dialogueBeats
+        .filter((b) => b.startOffsetSec + b.durationSec > offsetSec + 1)
+        .map((b) => b.text)
+        .join(' ')
+        .trim();
+      if (spokenText) {
+        const segIdAtSpeech = segment.id;
+        this.browserSpeechActive = speakWithBrowserVoice({
+          text: spokenText,
+          hostId: segment.primaryHostId,
+          volume: this.volume,
+          onStart: () => {
+            if (this.currentSegmentId === segIdAtSpeech && this.enabled) {
+              this.isVoicePlaying = true;
+              this.duckMusic(true);
+            }
+          },
+          onEnd: () => {
+            this.browserSpeechActive = false;
+            this.isVoicePlaying = false;
+            this.duckMusic(false);
+          },
+        });
+      }
       return;
     }
 
@@ -329,7 +376,11 @@ class BroadcastAudioEngine {
   }
 
   public getVoiceLevel(): number {
-    if (!this.enabled || !this.voiceAnalyser || !this.isVoicePlaying) return 0;
+    if (!this.enabled || !this.isVoicePlaying) return 0;
+    if (this.browserSpeechActive) {
+      return 0.32 + 0.36 * Math.abs(Math.sin(Date.now() * 0.016));
+    }
+    if (!this.voiceAnalyser) return 0;
     this.voiceAnalyser.getByteFrequencyData(this.voiceFreqBins);
     let sum = 0;
     for (let i = 0; i < this.voiceFreqBins.length; i++) {

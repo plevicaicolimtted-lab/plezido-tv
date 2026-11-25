@@ -1,4 +1,12 @@
-import { Download, Laptop, Monitor, Share, Smartphone, X } from 'lucide-react';
+import {
+  Download,
+  ExternalLink,
+  Laptop,
+  Monitor,
+  Share,
+  Smartphone,
+  X,
+} from 'lucide-react';
 import { useEffect, useState } from 'react';
 import { type DevicePlatform, usePWAInstall } from '../hooks/usePWAInstall';
 
@@ -12,58 +20,71 @@ const PLATFORM_TABS: Array<{
   {
     id: 'iphone',
     label: 'iPhone',
-    title: 'Install on iPhone & iPad',
-    subtitle: 'Runs full-screen from your Home Screen with native iOS status bar integration.',
+    title: 'Download on iPhone & iPad',
+    subtitle: 'Installs directly to your Home Screen as a full-screen PleziDo TV app.',
     steps: [
-      'Open PleziDo TV in Safari on your iPhone or iPad.',
-      'Tap the Share button in the bottom or top Safari toolbar.',
+      'Open PleziDo TV (/watch) directly in Safari on your iPhone or iPad.',
+      'Tap the Share button in the Safari toolbar.',
       'Scroll down and tap "Add to Home Screen", then tap Add.',
     ],
   },
   {
     id: 'android',
     label: 'Android',
-    title: 'Install on Android',
-    subtitle: 'Installs as a native standalone broadcast app via Chrome or Edge on Android.',
+    title: 'Download on Android',
+    subtitle: 'Installs as a standalone broadcast app via Chrome or Edge on Android.',
     steps: [
-      'Tap "Install App Now" below if your browser prompt is ready.',
-      'Or open the browser menu (three dots) in the top right corner.',
-      'Select "Install app" or "Add to Home screen" to finish.',
+      'Open PleziDo TV in its own browser tab (if viewing inside a preview frame) and tap "Install App Now".',
+      'Or open the Chrome menu (three dots) in the top right corner.',
+      'Tap "Install app" or "Add to Home screen" to download.',
     ],
   },
   {
     id: 'windows',
     label: 'Windows',
-    title: 'Install on Windows 10 / 11',
-    subtitle: 'Pins PleziDo TV to your Start Menu and Taskbar as a dedicated desktop app.',
+    title: 'Download on Windows 10 / 11',
+    subtitle: 'Pins PleziDo TV to your Start Menu and Taskbar as a desktop TV app.',
     steps: [
-      'Click "Install App Now" below in Chrome or Microsoft Edge.',
-      'Or click the Install icon in the right side of your browser address bar.',
+      'Open PleziDo TV in its own Edge or Chrome window (click "Open Standalone Tab" below if embedded).',
+      'Click "Install App Now" or click the Install icon in the right side of the browser address bar.',
       'Confirm "Install" to launch PleziDo TV in its own desktop window.',
     ],
   },
   {
     id: 'linux',
     label: 'Linux',
-    title: 'Install on Linux Desktop',
-    subtitle: 'Creates a native desktop launcher entry for GNOME, KDE, and tiling window managers.',
+    title: 'Download on Linux Desktop',
+    subtitle: 'Creates a native desktop launcher entry for GNOME, KDE, and Chromium browsers.',
     steps: [
-      'Click "Install App Now" below in Chromium, Chrome, or Brave.',
-      'Or open the browser menu -> Save and share -> "Install PleziDo TV".',
-      'Pin to your dock or launch directly from your application menu.',
+      'Open PleziDo TV in its own Chromium, Chrome, or Brave browser tab.',
+      'Click "Install App Now" or open the browser menu -> Cast, save, and share -> "Install PleziDo TV".',
+      'Pin to your dock or launch from your system app launcher.',
     ],
   },
 ];
 
-export function PWAInstallButton() {
+interface PWAInstallButtonProps {
+  labelOverride?: string;
+}
+
+export function PWAInstallButton({ labelOverride }: PWAInstallButtonProps = {}) {
   const { isInstallable, isInstalled, platform, install } = usePWAInstall();
   const [modalOpen, setModalOpen] = useState(false);
   const [activeTab, setActiveTab] = useState<DevicePlatform>(platform);
   const [installing, setInstalling] = useState(false);
+  const [inIframe, setInIframe] = useState(false);
 
   useEffect(() => {
     setActiveTab(platform);
   }, [platform]);
+
+  useEffect(() => {
+    try {
+      setInIframe(window.self !== window.top);
+    } catch {
+      setInIframe(true);
+    }
+  }, []);
 
   if (isInstalled) {
     return null;
@@ -103,10 +124,14 @@ export function PWAInstallButton() {
         type="button"
         disabled={installing}
         onClick={() => void handlePrimaryClick()}
-        className="inline-flex items-center gap-1.5 rounded-lg bg-[#E11D48] px-3.5 py-1.5 text-xs font-semibold text-white hover:bg-[#BE123C] disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
+        className="inline-flex items-center gap-1.5 rounded-lg bg-[#E11D48] px-3.5 py-2 text-xs font-semibold text-white hover:bg-[#BE123C] disabled:opacity-60 transition-colors whitespace-nowrap shrink-0"
       >
         <Download className="h-3.5 w-3.5" aria-hidden="true" />
-        <span>{installing ? 'Installing…' : `Download App (${platformBadgeName})`}</span>
+        <span>
+          {installing
+            ? 'Installing…'
+            : labelOverride || `Download TV (${platformBadgeName})`}
+        </span>
       </button>
 
       {modalOpen && (
@@ -120,7 +145,10 @@ export function PWAInstallButton() {
             <div className="flex items-center justify-between border-b border-white/10 px-6 py-4">
               <div>
                 <p className="text-xs text-slate-400">Installable Standalone Broadcast App</p>
-                <h3 id="pwa-install-title" className="mt-0.5 font-display text-lg font-bold text-white">
+                <h3
+                  id="pwa-install-title"
+                  className="mt-0.5 font-display text-lg font-bold text-white"
+                >
                   Download PleziDo TV
                 </h3>
               </div>
@@ -135,6 +163,23 @@ export function PWAInstallButton() {
             </div>
 
             <div className="p-6 space-y-5">
+              {inIframe && (
+                <div className="rounded-lg border border-amber-500/30 bg-amber-500/10 p-3.5 text-xs text-amber-100 flex flex-col sm:flex-row sm:items-center justify-between gap-3">
+                  <span>
+                    Browsers only allow one-click app download outside an embedded preview frame.
+                  </span>
+                  <a
+                    href="/watch"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 rounded-md bg-white px-3 py-1.5 text-xs font-semibold text-[#06080D] hover:bg-slate-200 whitespace-nowrap shrink-0"
+                  >
+                    <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Open Standalone Tab</span>
+                  </a>
+                </div>
+              )}
+
               {/* OS Flavor Switcher */}
               <div className="grid grid-cols-4 gap-1 rounded-lg bg-[#070A10] p-1 border border-white/[0.06]">
                 {PLATFORM_TABS.map((tab) => {
@@ -180,7 +225,10 @@ export function PWAInstallButton() {
                       <span className="leading-relaxed">
                         {step}
                         {activeTab === 'iphone' && i === 1 && (
-                          <Share className="inline-block ml-1.5 h-3.5 w-3.5 text-slate-300" aria-hidden="true" />
+                          <Share
+                            className="inline-block ml-1.5 h-3.5 w-3.5 text-slate-300"
+                            aria-hidden="true"
+                          />
                         )}
                       </span>
                     </li>
@@ -199,9 +247,15 @@ export function PWAInstallButton() {
                     <span>Install App Now</span>
                   </button>
                 ) : (
-                  <span className="text-xs text-slate-400">
-                    Works offline-ready on iOS Safari, Android Chrome, Windows &amp; Linux.
-                  </span>
+                  <a
+                    href="/watch"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    className="inline-flex items-center gap-1.5 text-xs font-medium text-slate-300 hover:text-white underline decoration-white/20 underline-offset-4"
+                  >
+                    <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+                    <span>Launch Full Viewer App (/watch)</span>
+                  </a>
                 )}
 
                 <button

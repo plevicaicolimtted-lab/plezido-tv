@@ -4,9 +4,11 @@ import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import type { ChannelCategory } from './shared/broadcastTypes.js';
+import type { ChannelCategory, HostId } from './shared/broadcastTypes.js';
 import { broadcastDirector } from './server/broadcastDirector.js';
-import { getCachedSegmentAudio } from './server/geminiBroadcast.js';
+import { screenViewerRequest } from './server/contentModeration.js';
+import { getCachedSegmentAudio, talkWithAiHost } from './server/geminiBroadcast.js';
+import { attachLiveHostWebSocket } from './server/liveHostVoice.js';
 
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
@@ -199,7 +201,56 @@ async function startServer() {
     }
   });
 
+  app.post('/api/broadcast/talk', async (req, res) => {
+    try {
+      const { hostId, message, history, withVoice } = req.body as {
+        hostId?: HostId;
+        message?: string;
+        history?: Array<{ role: 'user' | 'host'; text: string }>;
+        withVoice?: boolean;
+      };
+
+      if (!message || typeof message !== 'string' || message.trim().length < 2) {
+        res.status(400).json({ error: 'Say or type at least 2 characters to talk with the host.' });
+        return;
+      }
+
+      const validHost: HostId =
+        hostId === 'elena' || hostId === 'marcus' || hostId === 'sora' ? hostId : 'sora';
+
+      const mod = await screenViewerRequest(
+        `talk-${Date.now()}`,
+        message.trim().slice(0, 180),
+        validHost === 'elena' ? 'news' : validHost === 'marcus' ? 'music' : 'culture'
+      );
+      if (!mod.allowed) {
+        res.status(422).json({ error: mod.report.notes });
+        return;
+      }
+
+      const result = await talkWithAiHost({
+        hostId: validHost,
+        message,
+        history: Array.isArray(history) ? history : [],
+        withVoice: withVoice !== false,
+      });
+
+      res.json(result);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : 'Unable to reach AI host right now';
+      const lower = msg.toLowerCase();
+      const status =
+        msg.includes('429') || lower.includes('quota')
+          ? 429
+          : msg.includes('503') || lower.includes('high demand') || lower.includes('unavailable')
+            ? 503
+            : 500;
+      res.status(status).json({ error: msg });
+    }
+  });
+
   const httpServer = http.createServer(app);
+  attachLiveHostWebSocket(httpServer);
 
   if (process.env.NODE_ENV !== 'production') {
     const { createServer: createViteServer } = await import('vite');

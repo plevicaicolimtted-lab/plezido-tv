@@ -12,13 +12,16 @@ import type {
   ViewerRequest,
 } from '../shared/broadcastTypes';
 import { broadcastAudioEngine } from './audio/broadcastAudioEngine';
+import { BroadcastArchiveSection } from './components/BroadcastArchiveSection';
 import { BroadcastStage } from './components/BroadcastStage';
 import { EditorialModerationPanel } from './components/EditorialModerationPanel';
 import { HostsRoster } from './components/HostsRoster';
 import { OfflineIndicator } from './components/OfflineIndicator';
 import { ProgramGuide } from './components/ProgramGuide';
 import { ScriptWriterStudio } from './components/ScriptWriterStudio';
+import { TalkativeAiHostPanel } from './components/TalkativeAiHostPanel';
 import { TopNav } from './components/TopNav';
+import { useFirebase } from './contexts/FirebaseContext';
 import { apiUrl } from './lib/apiUrl';
 
 const LazyViewerApp = lazy(() => import('./viewer/ViewerApp'));
@@ -40,6 +43,7 @@ export default function App() {
 }
 
 function StudioApp() {
+  const { user, persistedRequests, saveBroadcastRequest, saveBroadcastSegment } = useFirebase();
   const [broadcastState, setBroadcastState] = useState<BroadcastSyncState | null>(null);
   const [selectedChannel, setSelectedChannel] = useState<ChannelSelection>('auto');
   const [audioEnabled, setAudioEnabled] = useState(false);
@@ -462,6 +466,9 @@ function StudioApp() {
         }
         if (data.segment) {
           applyLiveSegmentLocally(data.segment);
+          if (user) {
+            void saveBroadcastSegment(data.segment, true).catch(() => undefined);
+          }
         }
         setSelectedChannel('auto');
       } catch (err) {
@@ -469,7 +476,7 @@ function StudioApp() {
         throw err;
       }
     },
-    [applyLiveSegmentLocally]
+    [applyLiveSegmentLocally, saveBroadcastSegment, user]
   );
 
   const handleSubmitRequest = useCallback(
@@ -508,6 +515,13 @@ function StudioApp() {
         });
       }
 
+      if (user && data.request) {
+        void saveBroadcastRequest(
+          data.request,
+          data.report?.notes || 'Cleared by editorial desk'
+        ).catch(() => undefined);
+      }
+
       if (res.status === 422 && data.report) {
         return {
           accepted: false,
@@ -523,7 +537,7 @@ function StudioApp() {
         message: `Cleared by editorial gate (${data.report?.notes || 'verified'}). Queued for upcoming broadcast.`,
       };
     },
-    []
+    [saveBroadcastRequest, user]
   );
 
   const handleWriteScript = useCallback(
@@ -569,6 +583,9 @@ function StudioApp() {
         }
         if (data.segment) {
           applyLiveSegmentLocally(data.segment);
+          if (user) {
+            void saveBroadcastSegment(data.segment, true).catch(() => undefined);
+          }
         }
         setSelectedChannel('auto');
       } catch (err) {
@@ -576,8 +593,15 @@ function StudioApp() {
         throw err;
       }
     },
-    [applyLiveSegmentLocally]
+    [applyLiveSegmentLocally, saveBroadcastSegment, user]
   );
+
+  const mergedQueue = useMemo(() => {
+    const liveQueue = broadcastState?.queue ?? [];
+    if (persistedRequests.length === 0) return liveQueue;
+    const seen = new Set(liveQueue.map((q) => q.id));
+    return [...liveQueue, ...persistedRequests.filter((p) => !seen.has(p.id))].slice(0, 24);
+  }, [broadcastState?.queue, persistedRequests]);
 
   return (
     <div className="min-h-screen bg-[#06080D] text-[#F4F6FA]">
@@ -631,6 +655,25 @@ function StudioApp() {
               onAirScript={handleAirScript}
             />
 
+            <TalkativeAiHostPanel
+              hosts={broadcastState.hosts}
+              activeChannel={displayedSegment.channel}
+              onTuneChannel={handleTuneChannel}
+              onHostSpeakingChange={(speaking) =>
+                broadcastAudioEngine.setExternalHostSpeaking(speaking)
+              }
+              onSendTopicToShow={async (suggestedTopic, hostId) => {
+                const channel: ChannelCategory =
+                  hostId === 'elena' ? 'news' : hostId === 'marcus' ? 'music' : 'culture';
+                await handleSubmitRequest(suggestedTopic, channel, 'Studio Talk');
+              }}
+            />
+
+            <BroadcastArchiveSection
+              currentSegment={displayedSegment}
+              onTuneChannel={handleTuneChannel}
+            />
+
             <ProgramGuide
               schedule={broadcastState.schedule}
               hosts={broadcastState.hosts}
@@ -648,7 +691,7 @@ function StudioApp() {
             />
 
             <EditorialModerationPanel
-              queue={broadcastState.queue}
+              queue={mergedQueue}
               moderationLog={broadcastState.moderationLog}
               onSubmitRequest={handleSubmitRequest}
             />

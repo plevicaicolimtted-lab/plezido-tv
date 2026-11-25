@@ -1,0 +1,279 @@
+rules_version = '2';
+
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Global Safety Net (Default Deny)
+    match /{document=**} {
+      allow read, write: if false;
+    }
+
+    // Global Hardened Primitives
+    function isValidId(id) {
+      return id is string && id.size() >= 1 && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$');
+    }
+
+    function incoming() {
+      return request.resource.data;
+    }
+
+    function existing() {
+      return resource.data;
+    }
+
+    function isSignedIn() {
+      return request.auth != null && request.auth.token.email_verified == true;
+    }
+
+    function isEmailAdmin() {
+      return isSignedIn() && request.auth.token.email == 'plevicaico.limtted@gmail.com';
+    }
+
+    function isAdmin() {
+      return isEmailAdmin() ||
+        (isSignedIn() && exists(/databases/$(database)/documents/admins/$(request.auth.uid)));
+    }
+
+    function isValidChannel(ch) {
+      return ch is string && ch in ['news', 'music', 'culture'];
+    }
+
+    function isValidChannelSelection(ch) {
+      return ch is string && ch in ['auto', 'news', 'music', 'culture'];
+    }
+
+    function isValidHostId(h) {
+      return h is string && h in ['elena', 'marcus', 'sora'];
+    }
+
+    function isValidCartoonStyle(s) {
+      return s is string && s in ['cel', 'anime', 'lofi'];
+    }
+
+    function isValidRequestStatus(st) {
+      return st is string && st in ['queued', 'producing', 'on-air', 'aired', 'flagged'];
+    }
+
+    function isValidVerdict(v) {
+      return v is string && v in ['cleared', 'cleared-with-caution', 'flagged-revised', 'blocked'];
+    }
+
+    // Validation Blueprints
+    function isValidUserProfile(data, userId) {
+      return data.keys().hasAll(['uid', 'displayName', 'preferredChannel', 'cartoonStyle', 'createdAt', 'updatedAt'])
+        && data.keys().hasOnly(['uid', 'displayName', 'preferredChannel', 'cartoonStyle', 'createdAt', 'updatedAt'])
+        && data.uid is string && data.uid == userId && data.uid == request.auth.uid
+        && data.displayName is string && data.displayName.size() >= 1 && data.displayName.size() <= 80
+        && isValidChannelSelection(data.preferredChannel)
+        && isValidCartoonStyle(data.cartoonStyle)
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidViewerFavorite(data, userId, favoriteId) {
+      return data.keys().hasAll(['id', 'userId', 'segmentId', 'headline', 'channel', 'showTitle', 'createdAt'])
+        && data.keys().hasOnly(['id', 'userId', 'segmentId', 'headline', 'channel', 'showTitle', 'createdAt'])
+        && data.id is string && data.id == favoriteId && isValidId(data.id) && data.id.size() <= 64
+        && data.userId is string && data.userId == userId && data.userId == request.auth.uid
+        && data.segmentId is string && isValidId(data.segmentId) && data.segmentId.size() <= 64
+        && data.headline is string && data.headline.size() >= 1 && data.headline.size() <= 180
+        && isValidChannel(data.channel)
+        && data.showTitle is string && data.showTitle.size() >= 1 && data.showTitle.size() <= 80
+        && data.createdAt is timestamp;
+    }
+
+    function isValidTalkMessage(data, userId, messageId) {
+      return data.keys().hasAll(['id', 'userId', 'hostId', 'role', 'text', 'channel', 'createdAt'])
+        && data.keys().hasOnly(['id', 'userId', 'hostId', 'role', 'text', 'channel', 'createdAt'])
+        && data.id is string && data.id == messageId && isValidId(data.id) && data.id.size() <= 64
+        && data.userId is string && data.userId == userId && data.userId == request.auth.uid
+        && isValidHostId(data.hostId)
+        && data.role is string && data.role in ['user', 'host']
+        && data.text is string && data.text.size() >= 1 && data.text.size() <= 1200
+        && isValidChannel(data.channel)
+        && data.createdAt is timestamp;
+    }
+
+    function isValidBroadcastRequest(data, requestId) {
+      return data.keys().hasAll([
+          'id', 'authorId', 'requesterName', 'category', 'topic',
+          'status', 'isPublicQueue', 'moderationNotes', 'createdAt', 'updatedAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'authorId', 'requesterName', 'category', 'topic',
+          'status', 'isPublicQueue', 'moderationNotes', 'segmentId', 'createdAt', 'updatedAt'
+        ])
+        && data.id is string && data.id == requestId && isValidId(data.id) && data.id.size() <= 64
+        && data.authorId is string && isValidId(data.authorId)
+        && data.requesterName is string && data.requesterName.size() >= 1 && data.requesterName.size() <= 40
+        && isValidChannel(data.category)
+        && data.topic is string && data.topic.size() >= 3 && data.topic.size() <= 180
+        && isValidRequestStatus(data.status)
+        && data.isPublicQueue is bool
+        && (data.status != 'flagged' || data.isPublicQueue == false)
+        && data.moderationNotes is string && data.moderationNotes.size() <= 300
+        && (!('segmentId' in data) || (data.segmentId is string && isValidId(data.segmentId) && data.segmentId.size() <= 64))
+        && data.createdAt is timestamp
+        && data.updatedAt is timestamp;
+    }
+
+    function isValidSavedSegment(data, segmentId) {
+      return data.keys().hasAll([
+          'id', 'authorId', 'channel', 'primaryHostId', 'showTitle',
+          'headline', 'subheadline', 'summary', 'dialogueText',
+          'musicTitle', 'musicBpm', 'verdict', 'isLiveGrounded',
+          'isPublicArchive', 'createdAt'
+        ])
+        && data.keys().hasOnly([
+          'id', 'authorId', 'channel', 'primaryHostId', 'coHostId', 'showTitle',
+          'headline', 'subheadline', 'summary', 'dialogueText',
+          'musicTitle', 'musicBpm', 'verdict', 'isLiveGrounded',
+          'isPublicArchive', 'createdAt'
+        ])
+        && data.id is string && data.id == segmentId && isValidId(data.id) && data.id.size() <= 64
+        && data.authorId is string && isValidId(data.authorId)
+        && isValidChannel(data.channel)
+        && isValidHostId(data.primaryHostId)
+        && (!('coHostId' in data) || isValidHostId(data.coHostId))
+        && data.showTitle is string && data.showTitle.size() >= 1 && data.showTitle.size() <= 80
+        && data.headline is string && data.headline.size() >= 1 && data.headline.size() <= 180
+        && data.subheadline is string && data.subheadline.size() >= 1 && data.subheadline.size() <= 220
+        && data.summary is string && data.summary.size() <= 500
+        && data.dialogueText is string && data.dialogueText.size() >= 1 && data.dialogueText.size() <= 2500
+        && data.musicTitle is string && data.musicTitle.size() >= 1 && data.musicTitle.size() <= 100
+        && data.musicBpm is number && data.musicBpm >= 40 && data.musicBpm <= 220
+        && isValidVerdict(data.verdict)
+        && data.isLiveGrounded is bool
+        && data.isPublicArchive is bool
+        && data.createdAt is timestamp;
+    }
+
+    // Trusted Admin Records (client writes strictly denied)
+    match /admins/{adminId} {
+      allow get: if isSignedIn() && isValidId(adminId) && request.auth.uid == adminId;
+      allow list, write: if false;
+    }
+
+    // User Profiles & Master-Gated Subcollections
+    match /userProfiles/{userId} {
+      allow get: if isSignedIn() && isValidId(userId) && (request.auth.uid == userId || isAdmin());
+      allow list: if isSignedIn() && (resource.data.uid == request.auth.uid || isEmailAdmin());
+      allow create: if isSignedIn()
+        && isValidId(userId)
+        && request.auth.uid == userId
+        && isValidUserProfile(incoming(), userId)
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isSignedIn()
+        && isValidId(userId)
+        && (request.auth.uid == userId || isAdmin())
+        && isValidUserProfile(incoming(), userId)
+        && incoming().uid == existing().uid
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && incoming().diff(existing()).affectedKeys().hasOnly([
+          'displayName', 'preferredChannel', 'cartoonStyle', 'updatedAt'
+        ]);
+      allow delete: if false;
+
+      match /favorites/{favoriteId} {
+        allow get: if isSignedIn() && isValidId(userId) && isValidId(favoriteId)
+          && (request.auth.uid == userId || isAdmin());
+        allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+        allow create: if isSignedIn()
+          && isValidId(userId)
+          && isValidId(favoriteId)
+          && request.auth.uid == userId
+          && isValidViewerFavorite(incoming(), userId, favoriteId)
+          && incoming().createdAt == request.time
+          && get(/databases/$(database)/documents/userProfiles/$(userId)).data.uid == request.auth.uid;
+        allow update: if false;
+        allow delete: if isSignedIn() && isValidId(userId) && isValidId(favoriteId)
+          && (request.auth.uid == userId || isAdmin());
+      }
+
+      match /talkMessages/{messageId} {
+        allow get: if isSignedIn() && isValidId(userId) && isValidId(messageId)
+          && (request.auth.uid == userId || isAdmin());
+        allow list: if isSignedIn() && resource.data.userId == request.auth.uid;
+        allow create: if isSignedIn()
+          && isValidId(userId)
+          && isValidId(messageId)
+          && request.auth.uid == userId
+          && isValidTalkMessage(incoming(), userId, messageId)
+          && incoming().createdAt == request.time
+          && get(/databases/$(database)/documents/userProfiles/$(userId)).data.uid == request.auth.uid;
+        allow update: if false;
+        allow delete: if isSignedIn() && isValidId(userId) && isValidId(messageId)
+          && (request.auth.uid == userId || isAdmin());
+      }
+    }
+
+    // Audience Topic & Music Requests
+    match /broadcastRequests/{requestId} {
+      allow get: if isSignedIn() && isValidId(requestId)
+        && (resource.data.authorId == request.auth.uid
+          || (resource.data.isPublicQueue == true && resource.data.status != 'flagged')
+          || isAdmin());
+      allow list: if isSignedIn()
+        && (resource.data.authorId == request.auth.uid
+          || (resource.data.isPublicQueue == true && resource.data.status != 'flagged')
+          || isEmailAdmin());
+      allow create: if isSignedIn()
+        && isValidId(requestId)
+        && isValidBroadcastRequest(incoming(), requestId)
+        && incoming().authorId == request.auth.uid
+        && incoming().status in ['queued', 'flagged']
+        && incoming().createdAt == request.time
+        && incoming().updatedAt == request.time;
+      allow update: if isSignedIn()
+        && isValidId(requestId)
+        && isValidBroadcastRequest(incoming(), requestId)
+        && incoming().id == existing().id
+        && incoming().authorId == existing().authorId
+        && incoming().createdAt == existing().createdAt
+        && incoming().updatedAt == request.time
+        && (
+          isAdmin()
+          || (
+            existing().status in ['queued', 'producing', 'on-air']
+            && existing().authorId == request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly(['status', 'segmentId', 'updatedAt'])
+          )
+        );
+      allow delete: if isSignedIn() && isValidId(requestId)
+        && (existing().authorId == request.auth.uid || isAdmin());
+    }
+
+    // Persisted Broadcast Segment Archive
+    match /savedSegments/{segmentId} {
+      allow get: if isSignedIn() && isValidId(segmentId)
+        && (resource.data.authorId == request.auth.uid
+          || resource.data.isPublicArchive == true
+          || isAdmin());
+      allow list: if isSignedIn()
+        && (resource.data.authorId == request.auth.uid
+          || resource.data.isPublicArchive == true
+          || isEmailAdmin());
+      allow create: if isSignedIn()
+        && isValidId(segmentId)
+        && isValidSavedSegment(incoming(), segmentId)
+        && incoming().authorId == request.auth.uid
+        && incoming().createdAt == request.time;
+      allow update: if isSignedIn()
+        && isValidId(segmentId)
+        && isValidSavedSegment(incoming(), segmentId)
+        && incoming().id == existing().id
+        && incoming().authorId == existing().authorId
+        && incoming().createdAt == existing().createdAt
+        && (
+          isAdmin()
+          || (
+            existing().authorId == request.auth.uid
+            && incoming().diff(existing()).affectedKeys().hasOnly(['isPublicArchive', 'summary'])
+          )
+        );
+      allow delete: if isSignedIn() && isValidId(segmentId)
+        && (existing().authorId == request.auth.uid || isAdmin());
+    }
+  }
+}
